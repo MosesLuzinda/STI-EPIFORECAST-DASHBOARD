@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "STI-EPI-FORECAST",
+    "slug": "sti-epi-forecast",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0b1220"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ]
+  }
+}

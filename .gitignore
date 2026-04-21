@@ -1,0 +1,8 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.vscode/
+mobile-app/node_modules/
+.expo/
+.streamlit/secrets.toml
