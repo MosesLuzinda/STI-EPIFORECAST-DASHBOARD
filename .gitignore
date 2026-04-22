@@ -6,3 +6,4 @@ __pycache__/
 mobile-app/node_modules/
 .expo/
 .streamlit/secrets.toml
+uploads/

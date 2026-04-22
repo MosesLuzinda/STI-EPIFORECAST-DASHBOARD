@@ -21,6 +21,51 @@ from app_pages import (
     render_roi_financing,
     render_sidebar_social_action_plan,
 )
+from pathogen_economy_pages import (
+    diseases_for,
+    render_pathogen_workspace_home,
+    render_vdtec_roi,
+    render_clinical_trial_sites,
+    render_nms_100_day_surge,
+    render_east_africa_regional,
+    render_717_impact,
+    render_sti_venture_matrix,
+    render_epi_thinktank,
+    render_developers,
+    render_reports_library,
+    render_pe_leadership_strip,
+)
+
+NAV_MODULES = [
+    "Strategic signals",
+    "Pathogen workspace",
+    "VDTEC & Pathogen ROI",
+    "Clinical trial sites",
+    "NMS 100-day surge",
+    "East Africa regional market",
+    "7-1-7 impact estimator",
+    "STI venture matrix",
+    "ROI & Financing",
+    "Executive Briefing",
+    "Disease Profiler",
+    "Global Surveillance",
+    "Forecast Lab",
+    "Uganda Hotspots",
+    "Action Plan",
+    "EPI-ThinkTank",
+    "Developers",
+    "Reports library",
+    "Admin",
+]
+ROI_NAV_MODULES = [
+    "VDTEC & Pathogen ROI",
+    "ROI & Financing",
+    "STI venture matrix",
+    "NMS 100-day surge",
+    "East Africa regional market",
+    "7-1-7 impact estimator",
+]
+MAIN_NAV_MODULES = [m for m in NAV_MODULES if m not in ROI_NAV_MODULES]
 
 # Optional map support
 try:
@@ -31,85 +76,49 @@ except:
     FOLIUM_OK = False
 
 # ---------------- PAGE CONFIG ----------------
-st.set_page_config(page_title="STI-EPI-FORECAST | Uganda MoH", page_icon="🦠", layout="wide")
+st.set_page_config(page_title="STI-EpiForecast App | Pathogen Economy", page_icon="🦠", layout="wide")
 
 st.markdown("""
 <style>
     .stApp {
         background:
-            radial-gradient(circle at 15% 20%, rgba(34, 197, 94, 0.12), transparent 30%),
-            radial-gradient(circle at 85% 10%, rgba(56, 189, 248, 0.10), transparent 35%),
-            linear-gradient(135deg, #07080e 0%, #101427 50%, #0f1f36 100%);
-        background-size: 120% 120%;
-        animation: gradientFlow 16s ease-in-out infinite;
-        color: white;
+            radial-gradient(circle at 12% 12%, rgba(29, 162, 74, 0.10), transparent 34%),
+            radial-gradient(circle at 90% 8%, rgba(59, 130, 246, 0.08), transparent 32%),
+            linear-gradient(180deg, #f6faf7 0%, #eef6f2 100%);
+        color: #0f172a;
     }
     header[data-testid="stHeader"] {
         display: none !important;
     }
-    .main { color: white; position: relative; z-index: 2; }
-    .main::before, .main::after {
-        content: "";
-        position: fixed;
-        width: 420px;
-        height: 420px;
-        border-radius: 999px;
-        filter: blur(90px);
-        z-index: 0;
-        pointer-events: none;
-    }
-    .main::before {
-        background: rgba(34, 197, 94, 0.16);
-        left: -120px;
-        top: 18%;
-        animation: floatBlobA 18s ease-in-out infinite;
-    }
-    .main::after {
-        background: rgba(59, 130, 246, 0.18);
-        right: -140px;
-        top: 62%;
-        animation: floatBlobB 22s ease-in-out infinite;
-    }
-    @keyframes gradientFlow {
-        0%, 100% { background-position: 0% 50%; }
-        50% { background-position: 100% 50%; }
-    }
-    @keyframes floatBlobA {
-        0%, 100% { transform: translate(0, 0); }
-        50% { transform: translate(40px, -35px); }
-    }
-    @keyframes floatBlobB {
-        0%, 100% { transform: translate(0, 0); }
-        50% { transform: translate(-35px, 25px); }
-    }
+    .main { color: #0f172a; position: relative; z-index: 2; }
     .stButton > button {
-        background: linear-gradient(45deg, #22c55e, #16a34a);
+        background: linear-gradient(45deg, #2b8a3e, #1f7a35);
         color: white; border-radius: 12px; border: none;
         padding: 10px 20px; font-weight: 700;
         width: 100%;
         transition: all 0.2s ease;
-        box-shadow: 0 6px 18px rgba(34, 197, 94, 0.22);
+        box-shadow: 0 4px 12px rgba(16, 24, 40, 0.15);
     }
     .stButton > button:hover {
         background: linear-gradient(45deg, #16a34a, #15803d);
         transform: translateY(-1px);
-        box-shadow: 0 8px 24px rgba(34, 197, 94, 0.35);
+        box-shadow: 0 8px 18px rgba(16, 24, 40, 0.20);
     }
     .stButton > button:focus {
         outline: 2px solid #86efac !important;
         outline-offset: 2px;
     }
     .hero-card {
-        background: linear-gradient(135deg, rgba(17,24,39,0.88), rgba(15,23,42,0.88));
-        border: 1px solid rgba(34, 197, 94, 0.35);
+        background: linear-gradient(180deg, #ffffff, #f7fbf8);
+        border: 1px solid #d9e7dd;
         border-radius: 20px;
         padding: 24px;
-        box-shadow: 0 10px 28px rgba(0,0,0,0.30);
+        box-shadow: 0 8px 20px rgba(15, 23, 42, 0.10);
         margin-bottom: 18px;
     }
     .feature-card {
-        background: rgba(15, 23, 42, 0.75);
-        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid #d8e2ea;
         border-radius: 14px;
         padding: 16px;
         min-height: 170px;
@@ -120,21 +129,21 @@ st.markdown("""
         padding: 8px 12px;
         border-radius: 999px;
         margin: 4px 6px 4px 0;
-        border: 1px solid rgba(34, 197, 94, 0.45);
-        background: rgba(34, 197, 94, 0.12);
-        color: #bbf7d0;
+        border: 1px solid rgba(34, 139, 34, 0.35);
+        background: rgba(34, 139, 34, 0.08);
+        color: #14532d;
         font-size: 0.88rem;
     }
     .status-panel {
-        background: rgba(15, 23, 42, 0.7);
-        border: 1px solid rgba(148, 163, 184, 0.28);
+        background: #ffffff;
+        border: 1px solid #d8e2ea;
         border-radius: 14px;
         padding: 12px;
         margin: 8px 0 12px 0;
     }
     .insight-panel {
-        background: rgba(15, 23, 42, 0.62);
-        border: 1px solid rgba(56, 189, 248, 0.35);
+        background: #f8fbfd;
+        border: 1px solid #cfe0ec;
         border-radius: 14px;
         padding: 12px 14px;
         margin-bottom: 10px;
@@ -148,40 +157,40 @@ st.markdown("""
         border-radius: 999px;
         border: 1px solid rgba(148, 163, 184, 0.35);
         font-size: 0.8rem;
-        background: rgba(15, 23, 42, 0.7);
+        background: rgba(255, 255, 255, 0.92);
     }
-    h1, h2, h3 {color: #ffffff; text-shadow: 0 2px 4px rgba(0,0,0,0.5);}
-    .stMarkdown, .stMarkdown p, [data-testid="stMarkdownContainer"] p { color: #e8f1ff !important; }
-    .stCaption, [data-testid="stCaption"] { color: #a5c7ff !important; font-weight: 500; }
-    label, span[data-baseweb="tag"] { color: #dbeafe !important; }
+    h1, h2, h3 {color: #0f172a;}
+    .stMarkdown, .stMarkdown p, [data-testid="stMarkdownContainer"] p { color: #1f2937 !important; }
+    .stCaption, [data-testid="stCaption"] { color: #475569 !important; font-weight: 500; }
+    label, span[data-baseweb="tag"] { color: #1f2937 !important; }
     [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, rgba(2, 6, 23, 0.95) 0%, rgba(15, 23, 42, 0.95) 100%) !important;
-        border-right: 1px solid rgba(148, 163, 184, 0.35);
+        background: linear-gradient(180deg, #f4f8f5 0%, #edf4f0 100%) !important;
+        border-right: 1px solid #d6e3da;
     }
     [data-testid="stSidebar"] .stMarkdown,
     [data-testid="stSidebar"] .stMarkdown p,
     [data-testid="stSidebar"] p,
     [data-testid="stSidebar"] span,
     [data-testid="stSidebar"] label {
-        color: #f8fafc !important;
-        font-weight: 600;
+        color: #1f2937 !important;
+        font-weight: 500;
     }
     [data-testid="stSidebar"] [data-testid="stCaption"] {
-        color: #e2e8f0 !important;
-        font-weight: 600 !important;
+        color: #475569 !important;
+        font-weight: 500 !important;
     }
     [data-testid="stSidebar"] [data-testid="stMetricValue"] {
-        color: #fef08a !important;
+        color: #14532d !important;
     }
     [data-testid="stSidebar"] [data-testid="stMetricLabel"] {
-        color: #bbf7d0 !important;
+        color: #374151 !important;
     }
     [data-testid="stSidebar"] .stRadio label,
     [data-testid="stSidebar"] .stSelectbox label {
-        color: #ffffff !important;
+        color: #1f2937 !important;
     }
-    [data-testid="stMetricValue"] { color: #fef9c3 !important; }
-    [data-testid="stMetricLabel"] { color: #a7f3d0 !important; }
+    [data-testid="stMetricValue"] { color: #14532d !important; }
+    [data-testid="stMetricLabel"] { color: #334155 !important; }
     @keyframes slideInUp {
         from { opacity: 0; transform: translateY(10px); }
         to { opacity: 1; transform: translateY(0); }
@@ -190,19 +199,98 @@ st.markdown("""
         from { opacity: 0; transform: translateX(18px); }
         to { opacity: 1; transform: translateX(0); }
     }
+    .hero-topnav-wrap {
+        margin-bottom: 14px;
+        border-radius: 18px;
+        overflow: visible;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 14px 30px rgba(15, 23, 42, 0.20);
+        background:
+            radial-gradient(130% 220% at 50% -60%, rgba(236, 72, 153, 0.35), rgba(76, 29, 149, 0.12) 38%, rgba(17, 24, 39, 0.96) 72%),
+            linear-gradient(90deg, #111827 0%, #1f1147 50%, #111827 100%);
+    }
+    .hero-topnav {
+        min-height: 76px;
+        padding: 0 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+    }
+    .hero-brand {
+        color: #f8fafc !important;
+        text-decoration: none !important;
+        font-weight: 700;
+        white-space: nowrap;
+        letter-spacing: 0.2px;
+    }
+    .hero-nav-links {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        flex: 1;
+        color: #d1d5db;
+        font-size: 0.92rem;
+        font-weight: 500;
+    }
+    .hero-nav-cta {
+        text-decoration: none !important;
+        color: #ffffff !important;
+        background: linear-gradient(135deg, #7c3aed, #4f46e5);
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-weight: 700;
+        font-size: 0.88rem;
+        white-space: nowrap;
+        box-shadow: 0 8px 18px rgba(79, 70, 229, 0.35);
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------- SHARED UX HELPERS ----------------
 def set_page(page_name: str):
     st.session_state["selected_nav"] = page_name
-    st.rerun()
 
 
 def nav_action_button(label: str, target_page: str, key: str):
     is_active = st.session_state.get("selected_nav") == target_page
-    if st.button(label, key=key, disabled=is_active):
+    if st.button(label, key=key, disabled=is_active, width="stretch"):
         set_page(target_page)
+
+
+def render_top_navigation():
+    grouped = [
+        ("Signals", ["Strategic signals", "Global Surveillance", "Uganda Hotspots"]),
+        ("Operations", ["Clinical trial sites", "NMS 100-day surge", "East Africa regional market", "Action Plan"]),
+        ("Leadership", ["Executive Briefing", "EPI-ThinkTank", "Developers", "Admin"]),
+        ("Pathogen Economy", ["Pathogen workspace", "VDTEC & Pathogen ROI", "STI venture matrix", "7-1-7 impact estimator"]),
+        ("Analysis", ["Disease Profiler", "Forecast Lab", "Reports library"]),
+    ]
+    nav_html = " / ".join(label for label, _ in grouped)
+    st.markdown(
+        f"""
+        <div class="hero-topnav-wrap">
+            <div class="hero-topnav">
+                <div class="hero-brand">
+                    STI-OP Navigation
+                </div>
+                <div class="hero-nav-links">{nav_html}</div>
+                <span class="hero-nav-cta">ROI &amp; Financing</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    cols = st.columns([1.1, 1.1, 1.1, 1.2, 1.0, 0.9])
+    for idx, (label, modules) in enumerate(grouped):
+        with cols[idx]:
+            with st.popover(label, use_container_width=True):
+                for module in modules:
+                    key = "nav_pop_" + module.replace(" ", "_").replace("&", "and").replace("/", "_")
+                    nav_action_button(module, module, key)
+    with cols[5]:
+        nav_action_button("ROI & Financing", "ROI & Financing", "nav_roi_financing_cta")
 
 
 def _init_feed_health():
@@ -333,64 +421,58 @@ logo_path = Path("logo1.png")
 if logo_path.exists():
     st.sidebar.image(str(logo_path), use_container_width=True)
 
-st.sidebar.title("🦠 STI-EPI-FORECAST")
-st.sidebar.caption("Government-ready outbreak intelligence workspace")
-st.sidebar.caption("Prepared for Ministry of Health - Republic of Uganda")
+st.sidebar.title("Science, Technology and Innovation")
+st.sidebar.caption("Making Uganda the STI powerhouse of East Africa")
 
-role_to_modules = {
-    "National Incident Commander": ["Executive Briefing", "Dashboard", "Global Surveillance", "Uganda Hotspots", "Action Plan", "ROI & Financing"],
-    "Surveillance Analyst": ["Global Surveillance", "Dashboard", "Uganda Hotspots", "Disease Profiler"],
-    "Epidemiology Modeler": ["Forecast Lab", "Disease Profiler", "Uganda Hotspots", "Global Surveillance"],
-    "Border Operations Lead": ["Executive Briefing", "Uganda Hotspots", "Global Surveillance", "Action Plan", "Forecast Lab"],
-    "Policy & Investment Lead": ["Executive Briefing", "Action Plan", "ROI & Financing", "Dashboard"],
-    "System Administrator": ["Dashboard", "Global Surveillance", "Admin"],
-}
-role_profiles = {
-    "National Incident Commander": {
-        "accent": "#ef4444",
-        "mission": "Coordinate national response posture and escalation decisions.",
-    },
-    "Surveillance Analyst": {
-        "accent": "#38bdf8",
-        "mission": "Monitor signal quality, detect anomalies, and validate outbreak intelligence.",
-    },
-    "Epidemiology Modeler": {
-        "accent": "#a78bfa",
-        "mission": "Model disease trajectories and test intervention scenarios.",
-    },
-    "Border Operations Lead": {
-        "accent": "#f59e0b",
-        "mission": "Manage entry-point screening and cross-border risk controls.",
-    },
-    "Policy & Investment Lead": {
-        "accent": "#22c55e",
-        "mission": "Prioritize policy actions and budget allocation for response readiness.",
-    },
-    "System Administrator": {
-        "accent": "#94a3b8",
-        "mission": "Keep the intelligence platform stable, integrated, and available.",
-    },
-}
-role = st.sidebar.selectbox("Role workspace", list(role_to_modules.keys()))
-nav_options = role_to_modules[role]
+hosts = ["Human", "Animal", "Plant"]
+if "pe_host" not in st.session_state:
+    st.session_state["pe_host"] = "Human"
+if st.session_state["pe_host"] not in hosts:
+    st.session_state["pe_host"] = "Human"
+pe_host = st.sidebar.selectbox(
+    "Host realm",
+    hosts,
+    index=hosts.index(st.session_state["pe_host"]),
+    key="pe_host_sb",
+)
+st.session_state["pe_host"] = pe_host
+
+conds = ["Communicable", "NCD", "Trauma & injuries"]
+if "pe_condition" not in st.session_state:
+    st.session_state["pe_condition"] = "Communicable"
+if st.session_state["pe_condition"] not in conds:
+    st.session_state["pe_condition"] = "Communicable"
+pe_condition = st.sidebar.selectbox(
+    "Condition class",
+    conds,
+    index=conds.index(st.session_state["pe_condition"]),
+    key="pe_condition_sb",
+)
+st.session_state["pe_condition"] = pe_condition
+
+disease_opts = diseases_for(pe_host, pe_condition)
+if "pe_disease" not in st.session_state or st.session_state["pe_disease"] not in disease_opts:
+    st.session_state["pe_disease"] = disease_opts[0]
+pe_disease = st.sidebar.selectbox(
+    "Disease / condition focus",
+    disease_opts,
+    index=disease_opts.index(st.session_state["pe_disease"]),
+    key=f"pe_disease_sb_{pe_host}_{pe_condition}",
+)
+st.session_state["pe_disease"] = pe_disease
+
+legacy_profiler = ["Cholera", "Malaria", "Typhoid", "Marburg"]
+if pe_disease in legacy_profiler:
+    st.session_state["policy_disease"] = pe_disease
+
+st.sidebar.divider()
+
+nav_options = NAV_MODULES
 if "selected_nav" not in st.session_state:
     st.session_state["selected_nav"] = nav_options[0]
-if "sidebar_nav" not in st.session_state:
-    st.session_state["sidebar_nav"] = nav_options[0]
 if st.session_state["selected_nav"] not in nav_options:
     st.session_state["selected_nav"] = nav_options[0]
-if st.session_state["sidebar_nav"] not in nav_options:
-    st.session_state["sidebar_nav"] = nav_options[0]
 
-def _on_sidebar_nav_change():
-    st.session_state["selected_nav"] = st.session_state["sidebar_nav"]
-
-default_idx = (
-    nav_options.index(st.session_state["selected_nav"])
-    if st.session_state["selected_nav"] in nav_options
-    else 0
-)
-st.sidebar.radio("Navigation", nav_options, index=default_idx, key="sidebar_nav", on_change=_on_sidebar_nav_change)
 nav = st.session_state["selected_nav"]
 
 st.sidebar.divider()
@@ -402,7 +484,6 @@ if st.sidebar.button("🔄 Refresh Live Feeds", key="refresh_live_feeds"):
     st.session_state["last_manual_refresh"] = datetime.now()
     st.rerun()
 
-st.sidebar.caption("Outbreak and open-web snapshot refreshes every <=30s (cache). Malaria OWID refreshes hourly.")
 st.sidebar.caption(f"Last manual refresh: {st.session_state['last_manual_refresh'].strftime('%H:%M:%S')}")
 st.sidebar.markdown(
     f"""
@@ -417,22 +498,6 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-st.sidebar.markdown("#### Feed controls")
-fc1, fc2 = st.sidebar.columns(2)
-with fc1:
-    if st.button("Retry Malaria", key="retry_malaria"):
-        increment_feed_retry("malaria")
-        st.session_state["retry_request"] = "malaria"
-        st.session_state["last_manual_refresh"] = datetime.now()
-        st.rerun()
-    if st.button("Retry Outbreak", key="retry_outbreak"):
-        increment_feed_retry("outbreak")
-        st.session_state["retry_request"] = "outbreak"
-        st.session_state["last_manual_refresh"] = datetime.now()
-        st.rerun()
-with fc2:
-    st.caption("Global feed retry not required")
-
 st.sidebar.markdown("#### Feed diagnostics")
 for feed_key, feed_label in [
     ("malaria", "Malaria"),
@@ -444,45 +509,15 @@ for feed_key, feed_label in [
     if diag["last_error"]:
         st.sidebar.caption(f"Last error: {diag['last_error']}")
 
-st.sidebar.markdown("#### Quick actions")
-qa1, qa2 = st.sidebar.columns(2)
-with qa1:
-    if "Dashboard" in nav_options:
-        nav_action_button("📊 Dashboard", "Dashboard", "qa_dash")
-    if "Executive Briefing" in nav_options:
-        nav_action_button("🧭 Briefing", "Executive Briefing", "qa_brief")
-with qa2:
-    if "Forecast Lab" in nav_options:
-        nav_action_button("🔮 Forecast", "Forecast Lab", "qa_forecast")
-    if "Global Surveillance" in nav_options:
-        nav_action_button("🌐 Global", "Global Surveillance", "qa_global")
-
 if nav == "Action Plan":
     render_sidebar_social_action_plan(realtime_data)
 
-st.sidebar.info("📡 Decision modules: surveillance, hotspot monitoring, forecasting, and response planning.")
+st.sidebar.info("📡 VDTEC: vaccines, drugs, diagnostics, consumables, devices — risk → volumes → ROI.")
 
-try:
-    frag = getattr(st, "fragment", None)
-    if callable(frag):
-
-        @frag(run_every=timedelta(seconds=20))
-        def _sidebar_live_tick():
-            # Fragment must not use st.sidebar.*; invoke this function inside `with st.sidebar:`.
-            st.caption(f"Live UI tick: {datetime.now().strftime('%H:%M:%S')} (partial refresh)")
-
-        with st.sidebar:
-            _sidebar_live_tick()
-except Exception:
-    pass
-
-# ---------------- ROLE CONTEXT ----------------
-role_mission = role_profiles[role]["mission"]
-handoff_text = f"Current module: {nav}. Next recommended module: {nav_options[min(len(nav_options)-1, (nav_options.index(nav)+1) if nav in nav_options else 0)]}."
-st.markdown(f"#### {role}")
-st.caption(role_mission)
-st.caption(f"Workflow handoff — {handoff_text}")
-st.caption("Use this role view to prepare briefing-ready outputs for Cabinet, MoH leadership, and district command teams.")
+# ---------------- TOP NAV + LEADERSHIP ----------------
+render_top_navigation()
+nav = st.session_state["selected_nav"]
+render_pe_leadership_strip()
 
 # ---------------- HELPERS ----------------
 def make_trend_series(base_value: int, days: int = 14, daily_step: int = 300, noise: int = 3000):
@@ -490,12 +525,42 @@ def make_trend_series(base_value: int, days: int = 14, daily_step: int = 300, no
     vals = [base_value - random.randint(noise, noise * 2) + i * daily_step for i in range(days)]
     return dates, vals
 
-# ---------------- DASHBOARD ----------------
+# ---------------- PATHOGEN ECONOMY + CORE MODULES ----------------
 if nav == "Executive Briefing":
     render_executive_brief(realtime_data)
 
-elif nav == "Dashboard":
-    st.title("🌍 National Outbreak Operations Dashboard")
+elif nav == "Pathogen workspace":
+    render_pathogen_workspace_home(realtime_data)
+
+elif nav == "VDTEC & Pathogen ROI":
+    render_vdtec_roi(realtime_data)
+
+elif nav == "Clinical trial sites":
+    render_clinical_trial_sites()
+
+elif nav == "NMS 100-day surge":
+    render_nms_100_day_surge()
+
+elif nav == "East Africa regional market":
+    render_east_africa_regional(realtime_data)
+
+elif nav == "7-1-7 impact estimator":
+    render_717_impact()
+
+elif nav == "STI venture matrix":
+    render_sti_venture_matrix()
+
+elif nav == "EPI-ThinkTank":
+    render_epi_thinktank()
+
+elif nav == "Developers":
+    render_developers()
+
+elif nav == "Reports library":
+    render_reports_library(realtime_data)
+
+elif nav == "Strategic signals":
+    st.title("🌍 Strategic signals (national dashboard)")
     st.caption(f"🔄 {realtime_data['last_updated']} • {realtime_data['data_source']}")
     if st.session_state["feed_health"]["outbreak"]["status"] == "degraded":
         st.warning("Outbreak feed is in degraded mode. Showing baseline signals while enrichment feed is unavailable.")
@@ -652,10 +717,10 @@ elif nav == "Admin":
 elif nav == "Global Surveillance":
     render_global_view(realtime_data)
 
-# ---------------- ROI & FINANCING ----------------
+# ---------------- ROI & FINANCING (legacy module) ----------------
 elif nav == "ROI & Financing":
     render_roi_financing()
 
 # ---------------- FOOTER ----------------
 st.sidebar.markdown("---")
-st.sidebar.caption("✅ STI-EPI-FORECAST • Role-based outbreak intelligence workspace")
+st.sidebar.caption("STI-OP decision support workspace")

@@ -41,7 +41,7 @@ def load_malaria_uganda_real():
 
 
 def _http_headers():
-    return {"User-Agent": "STI-EPI-FORECAST/1.0 (public health dashboard; +https://github.com)"}
+    return {"User-Agent": "STI-EpiForecast/1.0 (Pathogen Economy dashboard; +https://github.com)"}
 
 
 def _fetch_gdelt_hits(timeout_sec: float = 5) -> tuple[int, bool]:
@@ -424,7 +424,7 @@ def build_admin_update_message(realtime_data: dict, risk: dict) -> str:
     )
     top_alerts = "\n".join(f"- {line}" for line in alerts[:3])
     return (
-        "STI-EPI-FORECAST Risk Update\n\n"
+        "STI-EpiForecast App — Risk Update\n\n"
         f"Time (UTC): {_utc_now_iso()}\n"
         f"Risk level: {risk['risk_level']} ({risk['risk_score']}/100)\n"
         f"Signal mentions (24h): {risk['mentions']:,}\n"
@@ -458,7 +458,7 @@ def evaluate_and_send_admin_notifications(realtime_data: dict) -> dict:
     )
     if due_daily:
         ok, msg = send_admin_email(
-            subject=f"[Daily] STI-EPI-FORECAST {risk['risk_level']} risk",
+            subject=f"[Daily] STI-EpiForecast {risk['risk_level']} risk",
             body_text=body,
             recipients=recipients,
         )
@@ -486,3 +486,210 @@ def evaluate_and_send_admin_notifications(realtime_data: dict) -> dict:
 
     save_admin_alert_config(config)
     return result
+
+
+def _ai_chat_text(system_prompt: str, user_prompt: str, temperature: float = 0.25, timeout_sec: float = 35) -> str | None:
+    api_key, base_url, model = _ai_env_credentials()
+    if not api_key:
+        return None
+    try:
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": temperature,
+            },
+            timeout=timeout_sec,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+
+def _vdtec_fallback_catalog(host: str, disease: str, condition_class: str) -> list[dict]:
+    """Rule-based VDTEC lines when AI is unavailable."""
+    rows: list[dict] = []
+    if condition_class != "Communicable":
+        rows.extend(
+            [
+                {"Category": "Drug", "Product": f"First-line therapy pack — {disease}", "Licensed (Y/N)": "Y", "_qty_base": 120_000, "Unit": "course", "_rev_band": 4.2, "_roi_band": "1.4x – 2.1x", "_gou_return_low": 5.0, "_gou_return_high": 9.0, "_gou_invest": 4.0},
+                {"Category": "Diagnostic", "Product": "Point-of-care metabolic panel", "Licensed (Y/N)": "Y", "_qty_base": 85_000, "Unit": "test", "_rev_band": 2.1, "_roi_band": "1.2x – 1.8x", "_gou_return_low": 2.5, "_gou_return_high": 4.2, "_gou_invest": 2.2},
+                {"Category": "Medical device", "Product": "Home BP / glucose monitoring kit", "Licensed (Y/N)": "Y", "_qty_base": 200_000, "Unit": "kit", "_rev_band": 3.0, "_roi_band": "1.1x – 1.7x", "_gou_return_low": 3.0, "_gou_return_high": 5.0, "_gou_invest": 3.2},
+            ]
+        )
+        if condition_class == "Trauma & injuries":
+            rows.insert(
+                0,
+                {"Category": "Consumable", "Product": "Major haemorrhage pack (IV access + fluids)", "Licensed (Y/N)": "Y", "_qty_base": 45_000, "Unit": "pack", "_rev_band": 2.8, "_roi_band": "1.3x – 2.0x", "_gou_return_low": 3.5, "_gou_return_high": 6.0, "_gou_invest": 3.0},
+            )
+        return rows
+
+    if disease == "Malaria":
+        vac_note = "RTS,S / R21 (partial protection)"
+    else:
+        vac_note = disease
+    human_vac_lic = "N" if disease in ("Marburg", "HIV/AIDS") else "Y"
+
+    if host == "Human":
+        rows = [
+            {"Category": "Vaccine", "Product": f"Primary vaccine candidate — {vac_note}", "Licensed (Y/N)": human_vac_lic, "_qty_base": 2_400_000, "Unit": "dose", "_rev_band": 18.0, "_roi_band": "2.0x – 3.8x", "_gou_return_low": 40.0, "_gou_return_high": 95.0, "_gou_invest": 22.0},
+            {"Category": "Drug", "Product": f"Antimicrobial / antiviral course — {disease}", "Licensed (Y/N)": "Y", "_qty_base": 800_000, "Unit": "course", "_rev_band": 9.0, "_roi_band": "1.5x – 2.4x", "_gou_return_low": 12.0, "_gou_return_high": 22.0, "_gou_invest": 8.0},
+            {"Category": "Diagnostic", "Product": f"RDT / PCR tier-1 — {disease}", "Licensed (Y/N)": "Y", "_qty_base": 1_100_000, "Unit": "test", "_rev_band": 6.5, "_roi_band": "1.3x – 2.0x", "_gou_return_low": 7.0, "_gou_return_high": 13.0, "_gou_invest": 5.5},
+            {"Category": "Consumable", "Product": "PPE + safe injection set (national buffer)", "Licensed (Y/N)": "Y", "_qty_base": 3_500_000, "Unit": "procedure pack", "_rev_band": 5.0, "_roi_band": "1.1x – 1.6x", "_gou_return_low": 5.0, "_gou_return_high": 8.0, "_gou_invest": 4.5},
+            {"Category": "Medical device", "Product": "Oxygen concentrators + consumables", "Licensed (Y/N)": "Y", "_qty_base": 12_000, "Unit": "device", "_rev_band": 7.0, "_roi_band": "1.2x – 1.9x", "_gou_return_low": 6.0, "_gou_return_high": 11.0, "_gou_invest": 5.0},
+        ]
+        if disease == "Marburg":
+            rows[0]["Licensed (Y/N)"] = "N"
+            rows[0]["Product"] = "Filovirus vaccine candidate (no routine licensed vaccine)"
+    elif host == "Animal":
+        rows = [
+            {"Category": "Vaccine", "Product": f"Sector vaccine — {disease}", "Licensed (Y/N)": "N" if disease in ("African swine fever",) else "Y", "_qty_base": 1_200_000, "Unit": "dose", "_rev_band": 6.0, "_roi_band": "1.4x – 2.2x", "_gou_return_low": 8.0, "_gou_return_high": 15.0, "_gou_invest": 6.0},
+            {"Category": "Drug", "Product": "Anthelmintic / antimicrobial surge pack", "Licensed (Y/N)": "Y", "_qty_base": 400_000, "Unit": "course", "_rev_band": 3.5, "_roi_band": "1.2x – 1.8x", "_gou_return_low": 4.0, "_gou_return_high": 7.0, "_gou_invest": 3.5},
+            {"Category": "Diagnostic", "Product": "Vet-side serology / antigen RDT", "Licensed (Y/N)": "Y", "_qty_base": 250_000, "Unit": "test", "_rev_band": 2.0, "_roi_band": "1.1x – 1.6x", "_gou_return_low": 2.0, "_gou_return_high": 3.5, "_gou_invest": 1.8},
+            {"Category": "Consumable", "Product": "Cold chain consumables + PPE", "Licensed (Y/N)": "Y", "_qty_base": 600_000, "Unit": "kit", "_rev_band": 1.5, "_roi_band": "1.0x – 1.5x", "_gou_return_low": 1.5, "_gou_return_high": 2.5, "_gou_invest": 1.4},
+            {"Category": "Medical device", "Product": "Portable ultrasound / dosing equipment", "Licensed (Y/N)": "Y", "_qty_base": 2_500, "Unit": "unit", "_rev_band": 2.2, "_roi_band": "1.1x – 1.7x", "_gou_return_low": 2.5, "_gou_return_high": 4.0, "_gou_invest": 2.0},
+        ]
+    else:
+        rows = [
+            {"Category": "Vaccine", "Product": "Prophylactic / biocontrol programme (no classical vaccine)", "Licensed (Y/N)": "N", "_qty_base": 50_000, "Unit": "ha-pack", "_rev_band": 0.8, "_roi_band": "1.0x – 1.4x", "_gou_return_low": 0.8, "_gou_return_high": 1.4, "_gou_invest": 0.7},
+            {"Category": "Drug", "Product": f"Registered fungicide / bactericide — {disease}", "Licensed (Y/N)": "Y", "_qty_base": 400_000, "Unit": "L", "_rev_band": 3.0, "_roi_band": "1.2x – 1.9x", "_gou_return_low": 3.0, "_gou_return_high": 5.5, "_gou_invest": 2.5},
+            {"Category": "Diagnostic", "Product": "Field / lab pathogen detection kit", "Licensed (Y/N)": "Y", "_qty_base": 180_000, "Unit": "assay", "_rev_band": 1.8, "_roi_band": "1.1x – 1.7x", "_gou_return_low": 2.0, "_gou_return_high": 3.2, "_gou_invest": 1.6},
+            {"Category": "Consumable", "Product": "Vector control + PPE for field teams", "Licensed (Y/N)": "Y", "_qty_base": 220_000, "Unit": "team-day", "_rev_band": 1.2, "_roi_band": "1.0x – 1.4x", "_gou_return_low": 1.2, "_gou_return_high": 1.8, "_gou_invest": 1.1},
+            {"Category": "Medical device", "Product": "Irrigation / sensor hardware (precision control)", "Licensed (Y/N)": "Y", "_qty_base": 4_000, "Unit": "node", "_rev_band": 2.5, "_roi_band": "1.1x – 1.8x", "_gou_return_low": 2.5, "_gou_return_high": 4.0, "_gou_invest": 2.0},
+        ]
+    return rows
+
+
+def _normalize_vdtec_df(frame: pd.DataFrame) -> pd.DataFrame:
+    df = frame.copy()
+    if "Product" in df.columns and "Product / intervention" not in df.columns:
+        df = df.rename(columns={"Product": "Product / intervention"})
+    if "Unit" in df.columns and "Unit (illustrative)" not in df.columns:
+        df = df.rename(columns={"Unit": "Unit (illustrative)"})
+    return df
+
+
+@st.cache_data(ttl=180, show_spinner="Building VDTEC countermeasure rows...")
+def generate_pe_countermeasures_rows(
+    host: str,
+    disease: str,
+    condition_class: str,
+    risk_score: int,
+    use_ai: bool,
+) -> pd.DataFrame:
+    base = _vdtec_fallback_catalog(host, disease, condition_class)
+    df = _normalize_vdtec_df(pd.DataFrame(base))
+    if not use_ai:
+        return df
+
+    system = (
+        "Return ONLY valid JSON: an array of 5-8 objects with keys "
+        "category (one of Vaccine, Drug, Diagnostic, Consumable, Medical device), "
+        "product (short name), licensed_y (Y or N for whether a licensed human/vet/plant product exists today), "
+        "qty_base (integer baseline national 100-day units), unit (string), "
+        "rev_band_m (number, USD millions Year-1 revenue band mid), "
+        "roi_band (string like 1.2x-2.0x), gou_return_low_m, gou_return_high_m, gou_invest_m (numbers)."
+    )
+    user = (
+        f"Host: {host}. Disease/condition: {disease}. Class: {condition_class}. Risk score 0-100: {risk_score}. "
+        "Prioritize Uganda Pathogen Economy VDTEC planning."
+    )
+    raw = _ai_chat_text(system, user, temperature=0.2)
+    if not raw:
+        return _normalize_vdtec_df(df)
+    try:
+        blob = raw.strip()
+        if blob.startswith("```"):
+            blob = blob.split("```", 2)[1]
+            if blob.lower().startswith("json"):
+                blob = blob[4:]
+        data = json.loads(blob)
+        if not isinstance(data, list):
+            return _normalize_vdtec_df(df)
+        mapped = []
+        for item in data[:10]:
+            if not isinstance(item, dict):
+                continue
+            cat = str(item.get("category", "Drug")).title()
+            if cat not in {"Vaccine", "Drug", "Diagnostic", "Consumable", "Medical device"}:
+                cat = "Drug"
+            lic = "Y" if str(item.get("licensed_y", "Y")).upper().startswith("Y") else "N"
+            mapped.append(
+                {
+                    "Category": cat,
+                    "Product / intervention": str(item.get("product", "Countermeasure"))[:120],
+                    "Licensed (Y/N)": lic,
+                    "_qty_base": int(item.get("qty_base", 100_000)),
+                    "Unit (illustrative)": str(item.get("unit", "unit"))[:40],
+                    "_rev_band": float(item.get("rev_band_m", 2.0)),
+                    "_roi_band": str(item.get("roi_band", "1.2x – 1.8x"))[:32],
+                    "_gou_return_low": float(item.get("gou_return_low_m", 2.0)),
+                    "_gou_return_high": float(item.get("gou_return_high_m", 4.0)),
+                    "_gou_invest": float(item.get("gou_invest_m", 1.5)),
+                }
+            )
+        if mapped:
+            return pd.DataFrame(mapped)
+    except Exception:
+        pass
+    return _normalize_vdtec_df(df)
+
+
+def generate_venture_matrix_ai(refresh: bool = False) -> pd.DataFrame:
+    defaults = [
+        ("TRL / product maturity", 0.14, 62, "Science → pilot → scale"),
+        ("Regulatory & quality pathway", 0.16, 55, "NAFDAC / UVRI / MoH alignment"),
+        ("Domestic market absorption (NMS)", 0.12, 70, "Shelf space & reimbursement"),
+        ("IP & freedom to operate", 0.10, 48, "Patent landscape risk"),
+        ("Team & governance", 0.12, 66, "PE bureau execution bandwidth"),
+        ("Co-finance & offtake", 0.14, 52, "DFI / private anchor orders"),
+        ("7-1-7 impact elasticity", 0.10, 74, "Early detection value"),
+        ("EAC export readiness", 0.12, 58, "DRC / KEN border demand"),
+    ]
+    rows = [{"Variable": a, "Weight (0–1)": b, "Project score (0–100)": c, "Notes": d} for a, b, c, d in defaults]
+    df = pd.DataFrame(rows)
+    if not refresh:
+        return df
+
+    system = (
+        "Return ONLY JSON array of 6-10 objects: variable, weight (0-1), score (0-100), note. "
+        "Variables should guide STI funding decisions for Ugandan health/biotech ventures."
+    )
+    raw = _ai_chat_text(system, "Generate the matrix.", temperature=0.35)
+    if not raw:
+        return df
+    try:
+        blob = raw.strip()
+        if blob.startswith("```"):
+            blob = blob.split("```", 2)[1]
+            if blob.lower().startswith("json"):
+                blob = blob[4:]
+        data = json.loads(blob)
+        if not isinstance(data, list):
+            return df
+        out = []
+        for item in data[:12]:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                {
+                    "Variable": str(item.get("variable", "Factor"))[:80],
+                    "Weight (0–1)": float(item.get("weight", 0.1)),
+                    "Project score (0–100)": float(item.get("score", 50)),
+                    "Notes": str(item.get("note", ""))[:120],
+                }
+            )
+        if out:
+            return pd.DataFrame(out)
+    except Exception:
+        pass
+    return df

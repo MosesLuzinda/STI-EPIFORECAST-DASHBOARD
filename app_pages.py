@@ -1,4 +1,5 @@
 import random
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -32,11 +33,15 @@ def _risk_level(score: float):
 
 
 def _selected_disease():
-    default_disease = st.session_state.get("policy_disease", "Cholera")
+    canonical = ["Cholera", "Malaria", "Typhoid", "Marburg"]
+    pe = st.session_state.get("pe_disease")
+    default_disease = pe if pe in canonical else st.session_state.get("policy_disease", "Cholera")
+    if default_disease not in canonical:
+        default_disease = "Cholera"
     disease = st.selectbox(
         "Disease focus",
-        ["Cholera", "Malaria", "Typhoid", "Marburg"],
-        index=["Cholera", "Malaria", "Typhoid", "Marburg"].index(default_disease),
+        canonical,
+        index=canonical.index(default_disease),
         key="disease_focus_select",
     )
     st.session_state["policy_disease"] = disease
@@ -97,9 +102,25 @@ def render_disease_explorer():
     st.plotly_chart(fig_env, use_container_width=True)
 
 
+def _hotspot_scale(disease: str) -> float:
+    m = {
+        "Cholera": 1.18,
+        "Malaria": 1.10,
+        "Typhoid": 0.96,
+        "Marburg": 1.26,
+        "Ebola": 1.22,
+        "Yellow fever": 1.14,
+        "COVID-19": 1.05,
+        "HIV/AIDS": 0.92,
+        "Tuberculosis": 0.94,
+    }
+    return float(m.get(disease, 1.0))
+
+
 def render_region_watch():
     st.title("📍 Uganda Vulnerability Map (Hotspots & Risk)")
-    disease = _selected_disease()
+    focus = st.session_state.get("pe_disease") or _selected_disease()
+    st.caption(f"Spatial risk uses sidebar **Pathogen focus**: **{focus}** (scalar defaults for diseases not yet calibrated).")
     districts = [
         ("Kampala", 0.72),
         ("Wakiso", 0.64),
@@ -110,11 +131,11 @@ def render_region_watch():
         ("Mbarara", 0.45),
         ("Lira", 0.53),
     ]
-    disease_scale = {"Cholera": 1.18, "Malaria": 1.10, "Typhoid": 0.96, "Marburg": 1.26}
+    scale = _hotspot_scale(focus)
 
     records = []
     for district, base_risk in districts:
-        risk = min(0.98, base_risk * disease_scale[disease] + random.uniform(-0.05, 0.07))
+        risk = min(0.98, base_risk * scale + random.uniform(-0.05, 0.07))
         records.append(
             {
                 "District": district,
@@ -137,7 +158,7 @@ def render_region_watch():
             x="District",
             y="RiskScore",
             color="RiskLabel",
-            title=f"{disease} hotspot risk by district (UBOS shapefile-ready prototype)",
+            title=f"{focus} hotspot risk by district (UBOS shapefile-ready prototype)",
             color_discrete_map={"High": "#ef4444", "Medium": "#f59e0b", "Low": "#22c55e"},
         )
         fig_hotspot.update_layout(template="plotly_dark")
@@ -155,7 +176,7 @@ def render_forecast_lab():
     days = st.slider("Forecast horizon", 30, 100, 100)
     intervention = st.slider("Intervention effectiveness", 0.0, 0.9, 0.35, 0.01)
 
-    base_beta = {"Cholera": 0.36, "Malaria": 0.31, "Typhoid": 0.27, "Marburg": 0.44}[disease]
+    base_beta = {"Cholera": 0.36, "Malaria": 0.31, "Typhoid": 0.27, "Marburg": 0.44}.get(disease, 0.33)
     beta = base_beta * (1.0 - intervention)
     sigma = 1 / 5.2
     gamma = 1 / 8.5
@@ -477,6 +498,22 @@ def _render_action_plan_simulations(disease: str, realtime_data: dict):
 def render_admin():
     st.title("⚙️ Administration and Governance")
     st.info("Platform configuration, governance controls, and integration status for production readiness.")
+
+    reports_dir = Path("uploads") / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    st.markdown("#### Pathogen Economy — summary report uploads")
+    st.caption("Upload **briefing summaries only** (PDF, DOCX, images, text). Raw line-level datasets are out of scope here.")
+    up = st.file_uploader(
+        "Upload files to Reports library",
+        type=["pdf", "docx", "png", "jpg", "jpeg", "txt", "md"],
+        accept_multiple_files=True,
+        key="admin_pe_report_upload",
+    )
+    if up and st.button("Save to Reports library", key="admin_save_reports"):
+        for f in up:
+            dest = reports_dir / f.name
+            dest.write_bytes(f.getvalue())
+        st.success(f"Saved {len(up)} file(s) to uploads/reports/.")
     st.markdown("#### Current integrations")
     st.write(
         "- Real malaria death-rate time series from Our World in Data (Uganda).[web:61][web:54]\n"
@@ -527,7 +564,7 @@ def render_admin():
                 risk = analyze_outbreak_risk(test_data)
                 body = build_admin_update_message(test_data, risk)
                 ok, msg = send_admin_email(
-                    subject=f"[Test] STI-EPI-FORECAST {risk['risk_level']} risk bulletin",
+                    subject=f"[Test] STI-EpiForecast App {risk['risk_level']} risk bulletin",
                     body_text=body,
                     recipients=recipients,
                 )
