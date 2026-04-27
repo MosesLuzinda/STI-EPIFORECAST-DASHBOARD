@@ -7,3 +7,5 @@ mobile-app/node_modules/
 .expo/
 .streamlit/secrets.toml
 uploads/
+# Local SQLite signal store (do not commit)
+data/*.db

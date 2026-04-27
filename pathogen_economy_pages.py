@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import io
 import json
-import random
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +16,7 @@ import streamlit as st
 
 from data_services import (
     analyze_outbreak_risk,
+    compute_dashboard_metrics,
     generate_pe_countermeasures_rows,
     generate_venture_matrix_ai,
 )
@@ -297,7 +297,7 @@ def render_clinical_trial_sites():
     host_w = {"Human": 1.0, "Animal": 0.92, "Plant": 0.55}[host]
     records = []
     for district, base in districts:
-        r = min(0.98, base * host_w + random.uniform(-0.04, 0.06))
+        r = min(0.98, base * host_w)
         records.append(
             {
                 "District": district,
@@ -514,6 +514,16 @@ def render_reports_library(realtime_data: dict):
 
     host, condition, disease = _pe_context()
     risk = analyze_outbreak_risk(realtime_data)
+    dashboard = realtime_data.get("dashboard") or compute_dashboard_metrics(realtime_data)
+    rr1, rr2, rr3 = st.columns(3)
+    with rr1:
+        st.metric("Risk score", f"{int(risk.get('risk_score', 0))}/100", risk.get("risk_level", "n/a"))
+    with rr2:
+        st.metric("Open-web signals (24h)", f"{dashboard['open_web_total']:,}")
+    with rr3:
+        st.metric("Official health signals (24h)", f"{dashboard['official_total']:,}")
+
+    st.markdown("#### Brief generation")
     if st.button("Generate one-page summary (text)", key="gen_summary_txt"):
         buf = io.StringIO()
         generated_utc = f"{datetime.utcnow().isoformat()}Z"
@@ -595,6 +605,107 @@ def render_reports_library(realtime_data: dict):
             key="dl_gen_summary_txt",
         )
 
+    st.markdown("### Social + official health-site signal report")
+    st.caption(
+        "Build a focused signal report from social/open-web channels plus official health-site domains "
+        "(WHO, CDC, UN Global Health pages detected through GDELT domain monitoring)."
+    )
+    social_channels = realtime_data.get("social_channels") or {}
+    health_channels = realtime_data.get("health_site_signals") or {}
+    report_rows = []
+    for source, value in social_channels.items():
+        report_rows.append({"Channel": source, "Type": "Social/Open web", "Signals_24h": int(value or 0)})
+    for source, value in health_channels.items():
+        report_rows.append({"Channel": source, "Type": "Official health sites", "Signals_24h": int(value or 0)})
+    if report_rows:
+        df_signals = pd.DataFrame(report_rows).sort_values(["Type", "Signals_24h"], ascending=[True, False])
+        social_total = int(df_signals[df_signals["Type"] == "Social/Open web"]["Signals_24h"].sum())
+        health_total = int(df_signals[df_signals["Type"] == "Official health sites"]["Signals_24h"].sum())
+        combined_total = social_total + health_total
+        social_arrow = "↑ rising" if social_total >= 1400 else ("→ steady" if social_total >= 500 else "↓ low")
+        health_arrow = "↑ rising" if health_total >= 60 else ("→ steady" if health_total >= 20 else "↓ low")
+        signal_mix = "Social-dominant" if social_total > health_total * 2 else ("Balanced" if health_total > 0 else "Sparse")
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.metric("Social signal volume (24h)", f"{social_total:,}", social_arrow)
+        with k2:
+            st.metric("Official health-site volume (24h)", f"{health_total:,}", health_arrow)
+        with k3:
+            st.metric("Combined signal volume (24h)", f"{combined_total:,}", signal_mix)
+
+        mix_df = df_signals.groupby("Type", as_index=False)["Signals_24h"].sum()
+        fig_mix = px.bar(
+            mix_df,
+            x="Type",
+            y="Signals_24h",
+            color="Type",
+            title="Signal mix: social/open-web vs official health sites (24h)",
+            color_discrete_map={
+                "Social/Open web": "#2563eb",
+                "Official health sites": "#16a34a",
+            },
+        )
+        fig_mix.update_layout(showlegend=False)
+        st.plotly_chart(fig_mix, use_container_width=True)
+
+        top_channels = df_signals.sort_values("Signals_24h", ascending=False).head(8)
+        fig_top = px.bar(
+            top_channels,
+            x="Signals_24h",
+            y="Channel",
+            color="Type",
+            orientation="h",
+            title="Top channels by signal count (24h)",
+            color_discrete_map={
+                "Social/Open web": "#3b82f6",
+                "Official health sites": "#22c55e",
+            },
+        )
+        fig_top.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_top, use_container_width=True)
+
+        st.dataframe(df_signals, use_container_width=True, hide_index=True)
+        if st.button("Generate social + health signal report (.txt)", key="gen_social_health_txt"):
+            buf = io.StringIO()
+            generated_utc = f"{datetime.utcnow().isoformat()}Z"
+            buf.write("STI-EpiForecast - Social and Health-Site Signals Report\n")
+            buf.write("=" * 62 + "\n")
+            buf.write(f"Generated (UTC): {generated_utc}\n")
+            buf.write(f"Snapshot time: {realtime_data.get('last_updated', 'n/a')}\n")
+            buf.write(f"Social signal volume (24h): {social_total:,} ({social_arrow})\n")
+            buf.write(f"Official health-site volume (24h): {health_total:,} ({health_arrow})\n")
+            buf.write(f"Combined signal volume (24h): {combined_total:,}\n")
+            buf.write(
+                "Coverage note: WHO and CDC values are derived from their public feed endpoints; "
+                "UN Global Health is domain signal monitoring via GDELT (un.org). "
+                "Social values from X/LinkedIn/Meta require official API keys and permissions.\n\n"
+            )
+            buf.write("A) Social/open-web channels (24h)\n")
+            buf.write("-" * 62 + "\n")
+            for row in df_signals[df_signals["Type"] == "Social/Open web"].itertuples():
+                buf.write(f"- {row.Channel}: {row.Signals_24h:,}\n")
+            buf.write("\nB) Official health-site channels (24h)\n")
+            buf.write("-" * 62 + "\n")
+            for row in df_signals[df_signals["Type"] == "Official health sites"].itertuples():
+                buf.write(f"- {row.Channel}: {row.Signals_24h:,}\n")
+            buf.write("\nC) How to use this report\n")
+            buf.write("-" * 62 + "\n")
+            buf.write("1. Cross-check spikes against district events and routine surveillance reports.\n")
+            buf.write("2. Use WHO/CDC/UN domain spikes to prioritize rapid desk review and evidence validation.\n")
+            buf.write("3. Combine signal velocity with forecast and hotspot modules before policy actions.\n")
+            st.session_state["social_health_report_txt"] = buf.getvalue()
+        if st.session_state.get("social_health_report_txt"):
+            st.download_button(
+                "Download social + health signal report (.txt)",
+                st.session_state["social_health_report_txt"],
+                file_name=f"STI_EpiForecast_social_health_signals_{disease.replace(' ', '_')}.txt",
+                mime="text/plain",
+                key="dl_social_health_txt",
+            )
+    else:
+        st.info("Signal report preview unavailable in this snapshot.")
+
+    st.markdown("### Uploaded report assets")
     files = sorted(
         (p for p in REPORTS_DIR.glob("*") if p.is_file() and p.name != ".gitkeep"),
         key=lambda p: p.stat().st_mtime,
@@ -603,6 +714,7 @@ def render_reports_library(realtime_data: dict):
     if not files:
         st.info("No uploaded reports yet. Admins can upload PDF/DOCX summaries under **Admin → Report uploads**.")
     else:
+        st.caption("Most recent report files:")
         for idx, f in enumerate(files[:40]):
             if f.is_file():
                 data = f.read_bytes()

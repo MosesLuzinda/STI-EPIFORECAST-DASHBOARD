@@ -1,19 +1,80 @@
-import random
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from data_services import (
     analyze_outbreak_risk,
     build_admin_update_message,
+    compute_dashboard_metrics,
     generate_ai_nlp_alerts,
+    get_signal_sources,
+    list_validated_signal_diseases,
     load_admin_alert_config,
+    run_signal_forecast,
     save_admin_alert_config,
     send_admin_email,
 )
+
+
+def get_dashboard(realtime_data: dict | None) -> dict:
+    """Single source of truth for dashboard KPIs across every page."""
+    if not realtime_data:
+        return compute_dashboard_metrics({})
+    cached = realtime_data.get("dashboard")
+    if isinstance(cached, dict) and cached:
+        return cached
+    return compute_dashboard_metrics(realtime_data)
+
+
+def render_signal_sources_panel(realtime_data: dict, *, key_suffix: str = "", default_tab: str = "open_web"):
+    """
+    Render a unified, clickable list of the actual feed items behind the dashboard KPIs.
+    Each item links to the original article / post on the source site (Reddit, GDELT, WHO, etc.).
+    """
+    sources = get_signal_sources(realtime_data or {})
+    open_web = sources.get("open_web") or []
+    official = sources.get("official") or []
+    news = sources.get("news") or []
+    portals = sources.get("portals") or {}
+
+    def _render_items(items, empty_msg):
+        if not items:
+            st.info(empty_msg)
+            return
+        for idx, item in enumerate(items[:25], start=1):
+            title = str(item.get("title") or "Untitled signal")
+            url = str(item.get("url") or "").strip()
+            source = str(item.get("source") or "Source")
+            meta = str(item.get("meta") or "")
+            suffix = f" — _{meta}_" if meta else ""
+            if url:
+                st.markdown(f"{idx}. [{title}]({url}) · **{source}**{suffix}")
+            else:
+                st.markdown(f"{idx}. {title} · **{source}**{suffix}")
+
+    tab_labels = ["Open-web items", "Official feeds", "GDELT articles", "Source portals"]
+    tabs = st.tabs(tab_labels)
+    with tabs[0]:
+        st.caption("Reddit posts, Hacker News stories, and GDELT articles — click any title to open the original source.")
+        _render_items(open_web, "No open-web signal items in the current snapshot.")
+    with tabs[1]:
+        st.caption("WHO Disease Outbreak News, CDC outbreak updates, and UN global health references.")
+        _render_items(official, "No official feed items available right now.")
+    with tabs[2]:
+        st.caption("Top GDELT-tracked outbreak news articles, sorted by recency.")
+        _render_items(news, "No GDELT article links returned in the current snapshot.")
+    with tabs[3]:
+        st.caption("Direct links to the upstream source portals used by the dashboard.")
+        if not portals:
+            st.info("No portal references configured.")
+        else:
+            for label, url in portals.items():
+                st.markdown(f"- **{label}** → [{url}]({url})")
 
 
 UGANDA_TRAVEL_POINTS = {
@@ -135,14 +196,20 @@ def render_region_watch():
 
     records = []
     for district, base_risk in districts:
-        risk = min(0.98, base_risk * scale + random.uniform(-0.05, 0.07))
+        risk = min(0.98, base_risk * scale)
+        if risk >= 0.65:
+            trend = "Rising"
+        elif risk >= 0.50:
+            trend = "Stable"
+        else:
+            trend = "Falling"
         records.append(
             {
                 "District": district,
                 "RiskScore": round(risk, 2),
                 "RiskLabel": "High" if risk > 0.7 else ("Medium" if risk > 0.5 else "Low"),
                 "Estimated Cases (14d)": int(500 + risk * 2800),
-                "Trend": random.choice(["Rising", "Stable", "Falling"]),
+                "Trend": trend,
             }
         )
     df_risk = pd.DataFrame(records).sort_values("RiskScore", ascending=False)
@@ -167,19 +234,39 @@ def render_region_watch():
     st.dataframe(df_risk, use_container_width=True)
 
 
-def render_forecast_lab():
+def render_forecast_lab(realtime_data: dict | None = None):
     st.title("🔮 Uganda Vulnerability (SEIR + ML Signal)")
+    st.caption(
+        "Structured workflow: tune epidemiological assumptions, review transmission dynamics, "
+        "then validate ML outputs with incident history and live signal blending."
+    )
     disease = _selected_disease()
 
-    population = st.number_input("Total population", min_value=1_000_000, max_value=80_000_000, value=48_000_000, step=1_000_000)
-    initial_infected = st.number_input("Initial infected", min_value=100, max_value=400_000, value=12000, step=100)
-    days = st.slider("Forecast horizon", 30, 100, 100)
-    intervention = st.slider("Intervention effectiveness", 0.0, 0.9, 0.35, 0.01)
+    in1, in2, in3, in4 = st.columns([1.2, 1.1, 1, 1.1])
+    with in1:
+        population = st.number_input(
+            "Total population", min_value=1_000_000, max_value=80_000_000, value=48_000_000, step=1_000_000
+        )
+    with in2:
+        initial_infected = st.number_input(
+            "Initial infected", min_value=100, max_value=400_000, value=12000, step=100
+        )
+    with in3:
+        days = st.slider("Forecast horizon", 30, 100, 100)
+    with in4:
+        intervention = st.slider("Intervention effectiveness", 0.0, 0.9, 0.35, 0.01)
 
     base_beta = {"Cholera": 0.36, "Malaria": 0.31, "Typhoid": 0.27, "Marburg": 0.44}.get(disease, 0.33)
     beta = base_beta * (1.0 - intervention)
     sigma = 1 / 5.2
     gamma = 1 / 8.5
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.metric("Transmission factor (beta)", f"{beta:.3f}")
+    with t2:
+        st.metric("Incubation conversion (sigma)", f"{sigma:.3f}")
+    with t3:
+        st.metric("Recovery rate (gamma)", f"{gamma:.3f}")
 
     S = np.zeros(days + 1)
     E = np.zeros(days + 1)
@@ -287,12 +374,188 @@ def render_forecast_lab():
         "Use this to detect abnormal surge behavior beyond expected variation."
     )
 
-    st.subheader("Machine Learning Signal (Random Forest placeholder)")
-    ml_probability = min(0.98, max(0.05, (I[-1] / max(1, population * 0.01)) * 0.65 + random.uniform(0.08, 0.2)))
-    st.metric("Random Forest Outbreak Probability", f"{ml_probability * 100:.1f}%")
-    ml_label, _ = _risk_level(ml_probability)
-    st.caption(f"Current ML risk category: {ml_label}")
-    st.caption("Prototype uses a synthetic score. Replace with trained model (e.g., sklearn RandomForest) using historical district records.")
+    st.subheader("Machine Learning Signal (AI-validated live signals + Random Forest)")
+    st.caption(
+        "Forecast Lab now trains directly on the live signal stream. Every feed item "
+        "(GDELT / Reddit / HN / WHO / CDC / CIDRAP / ReliefWeb / PAHO) is first run "
+        "through the AI signal validator; only items confirmed as real outbreak signals "
+        "are persisted to the signal store and used to train the model below."
+    )
+
+    available_diseases = list_validated_signal_diseases(min_count=1)
+    disease_options = ["All diseases"] + available_diseases
+    default_disease_label = (
+        disease.lower() if disease and disease.lower() in [d.lower() for d in available_diseases]
+        else "All diseases"
+    )
+    if default_disease_label != "All diseases":
+        default_index = next(
+            (i for i, d in enumerate(disease_options) if d.lower() == default_disease_label),
+            0,
+        )
+    else:
+        default_index = 0
+
+    fc1, fc2, fc3 = st.columns([1.4, 1.0, 1.0])
+    with fc1:
+        forecast_disease_label = st.selectbox(
+            "Forecast scope",
+            disease_options,
+            index=default_index,
+            help="Train on signals tagged with a specific disease or use the full validated stream.",
+        )
+    with fc2:
+        horizon_days = st.slider("Forecast horizon (days)", 7, 30, 14)
+    with fc3:
+        lookback_days = st.slider("History window (days)", 30, 180, 120)
+
+    forecast_disease = None if forecast_disease_label == "All diseases" else forecast_disease_label
+
+    try:
+        sig_result = run_signal_forecast(
+            disease=forecast_disease,
+            horizon_days=int(horizon_days),
+            lookback_days=int(lookback_days),
+        )
+    except Exception as exc:
+        st.warning(f"Signal-trained forecast unavailable: {exc}")
+        sig_result = None
+
+    if sig_result and not sig_result["ok"]:
+        st.info(sig_result.get("reason") or "Signal history is still warming up.")
+        rows_available = int(sig_result.get("rows_available", 0))
+        min_days = int(sig_result.get("min_history_days", 14))
+        st.progress(min(1.0, rows_available / max(1, min_days)))
+        st.caption(
+            f"{rows_available} of {min_days} day(s) of validated signal history collected. "
+            "Keep the dashboard refreshing — every accepted feed item is persisted to "
+            "the signal store and accelerates this unlock."
+        )
+    elif sig_result and sig_result["ok"]:
+        history_df = sig_result["history"].copy()
+        forecast_df = sig_result["forecast"].copy()
+        backtest = sig_result.get("backtest") or {}
+
+        history_total = int(history_df["count"].sum())
+        forecast_next7 = float(forecast_df.head(7)["predicted"].sum()) if not forecast_df.empty else 0.0
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Validated signals (history window)", f"{history_total:,}")
+        with m2:
+            st.metric("Forecasted signals (next 7d)", f"{forecast_next7:,.0f}")
+        with m3:
+            mae_val = backtest.get("mae")
+            st.metric(
+                "Backtest MAE",
+                f"{mae_val:.2f}" if isinstance(mae_val, (int, float)) else "—",
+                help=(
+                    f"Mean absolute error on the held-out tail "
+                    f"({backtest.get('n', 0)} day(s))."
+                ),
+            )
+
+        fig_pred = go.Figure()
+        fig_pred.add_trace(
+            go.Scatter(
+                x=history_df["date"],
+                y=history_df["count"],
+                name="Validated history",
+                mode="lines+markers",
+                line=dict(color="#22c55e", width=2),
+            )
+        )
+        if not forecast_df.empty:
+            fig_pred.add_trace(
+                go.Scatter(
+                    x=forecast_df["date"],
+                    y=forecast_df["upper"],
+                    name="Upper band",
+                    mode="lines",
+                    line=dict(color="#fb923c", width=0),
+                    showlegend=False,
+                )
+            )
+            fig_pred.add_trace(
+                go.Scatter(
+                    x=forecast_df["date"],
+                    y=forecast_df["lower"],
+                    name="Confidence band",
+                    mode="lines",
+                    fill="tonexty",
+                    line=dict(color="#fb923c", width=0),
+                    fillcolor="rgba(251,146,60,0.18)",
+                )
+            )
+            fig_pred.add_trace(
+                go.Scatter(
+                    x=forecast_df["date"],
+                    y=forecast_df["predicted"],
+                    name="Forecast",
+                    mode="lines+markers",
+                    line=dict(color="#fb923c", width=3, dash="dot"),
+                )
+            )
+        fig_pred.update_layout(
+            title=f"AI-validated signal forecast — {sig_result['disease']}",
+            xaxis_title="Date",
+            yaxis_title="Validated signals / day",
+            template="plotly_dark",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_pred, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            importance = sig_result.get("feature_importance") or []
+            if importance:
+                imp_df = pd.DataFrame(importance).head(10)
+                fig_imp = px.bar(
+                    imp_df,
+                    x="importance",
+                    y="feature",
+                    orientation="h",
+                    title="Top features driving the forecast",
+                    color="importance",
+                    color_continuous_scale="Tealgrn",
+                )
+                fig_imp.update_layout(
+                    template="plotly_dark",
+                    yaxis={"categoryorder": "total ascending"},
+                )
+                st.plotly_chart(fig_imp, use_container_width=True)
+            else:
+                st.info("Feature importance unavailable for this slice yet.")
+        with c2:
+            if not forecast_df.empty:
+                table_df = forecast_df.copy()
+                table_df["date"] = pd.to_datetime(table_df["date"]).dt.strftime("%Y-%m-%d")
+                st.dataframe(
+                    table_df.rename(
+                        columns={
+                            "date": "Date",
+                            "predicted": "Predicted",
+                            "lower": "Lower",
+                            "upper": "Upper",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("No forecast rows generated for this horizon.")
+
+        bt_n = int(backtest.get("n", 0) or 0)
+        bt_mape = backtest.get("mape")
+        if bt_n > 0 and isinstance(bt_mape, (int, float)):
+            st.caption(
+                f"Backtest: {bt_n} held-out day(s) • MAE {backtest.get('mae'):.2f} • "
+                f"MAPE {bt_mape*100:.1f}% • Trained on validated signals only."
+            )
+        else:
+            st.caption(
+                "Backtest deferred until enough held-out history exists. "
+                "The current forecast uses the full validated history."
+            )
 
 
 def render_learning_hub():
@@ -344,25 +607,56 @@ def render_alerts_and_recommendations(realtime_data: dict):
 
     tab_ops, tab_social, tab_sim = st.tabs(["Operations", "Social & open web", "Measures & scenarios"])
     with tab_ops:
-        _render_action_plan_operations(disease)
+        _render_action_plan_operations(disease, realtime_data)
     with tab_social:
         _render_action_plan_social(disease, realtime_data)
     with tab_sim:
         _render_action_plan_simulations(disease, realtime_data)
 
+    st.markdown("### 🔗 Where each signal came from (live source links)")
+    st.caption(
+        "These are the actual feed items that drive the KPIs and the recommended posture above. "
+        "Click any title to open the original article or post on the source site."
+    )
+    render_signal_sources_panel(realtime_data, key_suffix="action_plan")
 
-def _render_action_plan_operations(disease: str):
+
+def _render_action_plan_operations(disease: str, realtime_data: dict):
+    dashboard = get_dashboard(realtime_data)
+    posture = dashboard["posture"]
+    posture_caption = {
+        "Surge": "Immediate review required",
+        "Elevated": "Heightened watch",
+        "Routine": "Routine monitoring",
+    }.get(posture, "Routine monitoring")
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Priority-1 alerts", "2", "Immediate review required")
+        st.metric("Priority-1 alerts", dashboard["priority_alerts"], posture_caption)
     with c2:
-        st.metric("High-risk districts", "6", "Resource surge recommended")
+        st.metric(
+            "High-risk districts",
+            dashboard["high_risk_districts"],
+            f"Urgency {dashboard['urgency']}/100",
+        )
     with c3:
-        st.metric("Response window", "24-72h", "Critical decision period")
+        st.metric("Response window", dashboard["response_window"], f"{posture} stance")
 
-    st.error(f"P1 • {disease} risk rising across key surveillance zones and travel corridors.")
-    st.warning("P2 • Vulnerable districts require immediate procurement and diagnostics reinforcement.")
-    st.info("P3 • Surveillance quality variance detected between districts (simulated monitoring signal).")
+    if dashboard["priority_alerts"] >= 1:
+        st.error(f"P1 • {disease} risk rising — {dashboard['priority_alerts']} cross-source alert(s) active.")
+    else:
+        st.success(f"P1 • No surge alerts for {disease} in the current 24h snapshot.")
+    if dashboard["official_total"] > 0:
+        st.warning(
+            f"P2 • {dashboard['official_total']} official health-feed signal(s) active — "
+            "verify procurement buffer for diagnostics and therapeutics."
+        )
+    else:
+        st.info("P2 • No active official health-feed signals — keep procurement on routine cadence.")
+    st.info(
+        f"P3 • Open-web volume {dashboard['open_web_total']:,} (24h) across {dashboard['feeds_online']}/"
+        f"{dashboard['feeds_total']} live feeds — keep cross-source monitoring on."
+    )
 
     action_map = {
         "Cholera": {
@@ -422,6 +716,7 @@ def _render_action_plan_social(disease: str, realtime_data: dict):
         "News / open web: GDELT (articles, 24h), Reddit public JSON search, Hacker News via Algolia. "
         "Set NEWSAPI_KEY for NewsAPI totals. Native X/Meta/TikTok feeds are not queried without their APIs."
     )
+    dashboard = get_dashboard(realtime_data)
     df = _social_df_from_realtime(realtime_data)
     c1, c2 = st.columns([1.2, 1])
     with c1:
@@ -436,36 +731,47 @@ def _render_action_plan_social(disease: str, realtime_data: dict):
         fig_bar.update_layout(template="plotly_dark", height=380)
         st.plotly_chart(fig_bar, use_container_width=True)
     with c2:
-        hours = list(range(24))[::-1]
-        base = int(realtime_data.get("social_urgency_score", 50))
-        trend = [max(5, min(98, base + random.randint(-8, 8) - i)) for i in range(24)]
-        fig_line = px.line(
-            x=hours,
-            y=trend,
-            markers=True,
-            title="Simulated social urgency (last 24 hourly ticks)",
-            labels={"x": "Hours ago", "y": "Urgency score"},
-        )
-        fig_line.update_traces(line_color="#f472b6", line_width=3)
-        fig_line.update_layout(template="plotly_dark", height=380)
-        st.plotly_chart(fig_line, use_container_width=True)
-    m1, m2, m3 = st.columns(3)
+        # Deterministic source-mix donut derived from the real channel volumes.
+        non_zero = df[df["Volume (24h est.)"] > 0]
+        if non_zero.empty:
+            st.info("No live channel volume in the current snapshot.")
+        else:
+            fig_donut = px.pie(
+                non_zero,
+                names="Channel",
+                values="Volume (24h est.)",
+                hole=0.55,
+                title="Source mix (24h)",
+            )
+            fig_donut.update_traces(textinfo="percent+label")
+            fig_donut.update_layout(template="plotly_dark", height=380, showlegend=False)
+            st.plotly_chart(fig_donut, use_container_width=True)
+    m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("GDELT / news signal", f"{realtime_data.get('news_mentions', 0):,}")
+        st.metric("GDELT / news signal", f"{dashboard['news_mentions']:,}")
     with m2:
-        st.metric("Simulated sentiment", f"{realtime_data.get('social_sentiment_index', 0):.2f}")
+        st.metric("Open-web (24h)", f"{dashboard['open_web_total']:,}")
     with m3:
-        st.metric("Sim. response tier", realtime_data.get("sim_recommended_tier", "Routine"))
+        st.metric("Sentiment proxy", f"{dashboard['sentiment']:.2f}")
+    with m4:
+        st.metric("Recommended posture", dashboard["posture"], dashboard["response_window"])
 
 
 def _render_action_plan_simulations(disease: str, realtime_data: dict):
     st.subheader("Scenario lab — what measures to take (simulation)")
-    urgency = int(realtime_data.get("social_urgency_score", 40))
-    surge = st.slider("Simulated surge intensity", 0, 100, min(urgency, 95), help="Raises synthetic load on response levers.")
+    dashboard = get_dashboard(realtime_data)
+    urgency = dashboard["urgency"]
+    surge = st.slider(
+        "Simulated surge intensity",
+        0,
+        100,
+        min(max(urgency, dashboard["signal_score"]), 95),
+        help="Pre-set from current signal intensity; adjust to test scenarios.",
+    )
     coverage = st.slider("Simulated intervention coverage %", 10, 95, 45)
     leak = st.slider("Simulated border screening gap %", 0, 40, 12)
 
-    risk_raw = surge * 0.45 + leak * 1.1 - coverage * 0.35 + random.uniform(-5, 8)
+    risk_raw = surge * 0.45 + leak * 1.1 - coverage * 0.35
     residual_risk = max(5, min(95, risk_raw))
     st.metric("Residual outbreak pressure (sim.)", f"{residual_risk:.0f}/100")
 
@@ -473,11 +779,11 @@ def _render_action_plan_simulations(disease: str, realtime_data: dict):
         {
             "Lever": ["Lab surge", "WASH push", "Risk comms", "Border checks", "Vaccine push"],
             "Impact if funded (sim.)": [
-                max(0, 72 - surge * 0.35 + coverage * 0.2),
-                max(0, 65 - surge * 0.25 + coverage * 0.25),
-                max(0, 58 - leak * 0.8 + coverage * 0.15),
-                max(0, 80 - leak * 1.2 + coverage * 0.1),
-                max(0, 50 - surge * 0.15 + coverage * 0.3),
+                max(0.0, 72 - surge * 0.35 + coverage * 0.20),
+                max(0.0, 65 - surge * 0.25 + coverage * 0.25),
+                max(0.0, 58 - leak * 0.80 + coverage * 0.15),
+                max(0.0, 80 - leak * 1.20 + coverage * 0.10),
+                max(0.0, 50 - surge * 0.15 + coverage * 0.30),
             ],
         }
     )
@@ -577,14 +883,143 @@ def render_admin():
         "Emergency emails are triggered when computed risk exceeds threshold."
     )
 
+    st.markdown("#### API setup and live connectivity checks")
+    st.caption(
+        "Use this panel to verify social and health feed connectors without restarting the app. "
+        "Secrets stay in environment variables and are never displayed in full."
+    )
+
+    def _mask(value: str, keep: int = 4) -> str:
+        if not value:
+            return "Not set"
+        if len(value) <= keep:
+            return "*" * len(value)
+        return "*" * (len(value) - keep) + value[-keep:]
+
+    token_x = (os.getenv("X_API_BEARER") or "").strip()
+    token_li = (os.getenv("LINKEDIN_ACCESS_TOKEN") or "").strip()
+    org_li = (os.getenv("LINKEDIN_ORG_ID") or "").strip()
+    token_meta = (os.getenv("META_ACCESS_TOKEN") or "").strip()
+    page_meta = (os.getenv("META_PAGE_ID") or "").strip()
+    key_news = (os.getenv("NEWSAPI_KEY") or os.getenv("NEWS_API_KEY") or "").strip()
+
+    cfg_df = pd.DataFrame(
+        [
+            {"Integration": "X / Twitter", "Credential": _mask(token_x), "Extra": ""},
+            {"Integration": "LinkedIn", "Credential": _mask(token_li), "Extra": f"ORG: {_mask(org_li, keep=3)}"},
+            {"Integration": "Facebook / Meta", "Credential": _mask(token_meta), "Extra": f"PAGE: {_mask(page_meta, keep=3)}"},
+            {"Integration": "NewsAPI", "Credential": _mask(key_news), "Extra": ""},
+        ]
+    )
+    st.dataframe(cfg_df, use_container_width=True, hide_index=True)
+
+    if st.button("Run live connector checks", key="admin_run_connector_checks"):
+        checks = []
+
+        def _run(name: str, fn):
+            try:
+                ok, msg = fn()
+                checks.append({"Source": name, "Status": "online" if ok else "offline", "Detail": msg})
+            except Exception as exc:
+                checks.append({"Source": name, "Status": "offline", "Detail": str(exc)[:140]})
+
+        def _check_x():
+            if not token_x:
+                return False, "Missing X_API_BEARER"
+            r = requests.get(
+                "https://api.twitter.com/2/tweets/search/recent",
+                params={"query": "cholera OR malaria OR outbreak lang:en", "max_results": 10},
+                timeout=8,
+                headers={"Authorization": f"Bearer {token_x}"},
+            )
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            return True, f"{len(r.json().get('data') or [])} recent posts"
+
+        def _check_linkedin():
+            if not token_li:
+                return False, "Missing LINKEDIN_ACCESS_TOKEN"
+            if not org_li:
+                return False, "Missing LINKEDIN_ORG_ID"
+            r = requests.get(
+                "https://api.linkedin.com/v2/shares",
+                params={"q": "owners", "owners": f"urn:li:organization:{org_li}", "count": 10},
+                timeout=8,
+                headers={"Authorization": f"Bearer {token_li}"},
+            )
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            return True, f"{len(r.json().get('elements') or [])} org shares"
+
+        def _check_meta():
+            if not token_meta:
+                return False, "Missing META_ACCESS_TOKEN"
+            if not page_meta:
+                return False, "Missing META_PAGE_ID"
+            r = requests.get(
+                f"https://graph.facebook.com/v20.0/{page_meta}/posts",
+                params={"limit": 10, "access_token": token_meta},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            return True, f"{len(r.json().get('data') or [])} page posts"
+
+        def _check_who():
+            r = requests.get(
+                "https://www.who.int/feeds/entity/emergencies/disease-outbreak-news/rss.xml",
+                timeout=8,
+                headers={"User-Agent": "STI-EpiForecast/1.0"},
+            )
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            if "<item>" not in r.text:
+                return False, "No feed items detected"
+            return True, "WHO outbreak feed reachable"
+
+        def _check_cdc():
+            r = requests.get(
+                "https://tools.cdc.gov/api/v2/resources/media/403372.rss",
+                timeout=8,
+                headers={"User-Agent": "STI-EpiForecast/1.0"},
+            )
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            if "<item>" not in r.text:
+                return False, "No feed items detected"
+            return True, "CDC feed reachable"
+
+        def _check_un():
+            r = requests.get(
+                "https://www.un.org",
+                timeout=8,
+                headers={"User-Agent": "STI-EpiForecast/1.0"},
+            )
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            return True, "UN portal reachable"
+
+        _run("X / Twitter API", _check_x)
+        _run("LinkedIn API", _check_linkedin)
+        _run("Facebook / Meta API", _check_meta)
+        _run("WHO feed", _check_who)
+        _run("CDC feed", _check_cdc)
+        _run("UN portal", _check_un)
+
+        df_checks = pd.DataFrame(checks)
+        st.dataframe(df_checks, use_container_width=True, hide_index=True)
+        online_n = int((df_checks["Status"] == "online").sum())
+        st.info(f"Connector check complete: {online_n}/{len(df_checks)} online.")
+
 
 def render_global_view(realtime_data):
     st.title("🌐 Global Surveillance (News + Social Signals)")
     st.caption(
-        "GDELT, Reddit, and Hacker News (Algolia) return real 24h counts when reachable; "
-        "NewsAPI activates with NEWSAPI_KEY. Choropleth values remain illustrative until district case feeds are connected."
+        "GDELT, Reddit, Hacker News, WHO, CDC, and UN feeds drive every KPI. "
+        "Click any signal in the Source Monitor tab to open the original article on the source site."
     )
 
+    dashboard = get_dashboard(realtime_data)
     tab1, tab2, tab3 = st.tabs(["Global Heatmap", "NLP Alerts", "Source Monitor"])
 
     with tab1:
@@ -598,32 +1033,53 @@ def render_global_view(realtime_data):
             {"iso_code": "ZMB", "location": "Zambia"},
             {"iso_code": "MWI", "location": "Malawi"},
         ]
-        base = int(realtime_data.get("cholera_cases", 38000))
-        df_cholera = pd.DataFrame(countries)
+        # Distribute the real combined-signal volume across the regional watchlist
+        # using transparent watch weights — no fabricated "38,000 cholera cases".
+        base_signal = max(0, dashboard["combined_total"])
         weights = [0.25, 0.14, 0.12, 0.08, 0.13, 0.10, 0.10, 0.08]
-        df_cholera["cholera_cases_sim"] = [int(base * w) for w in weights]
+        df_cholera = pd.DataFrame(countries)
+        df_cholera["signal_share"] = [round(base_signal * w) for w in weights]
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Estimated outbreak mentions", f"{df_cholera['cholera_cases_sim'].sum():,}")
+            st.metric(
+                "Combined signal volume (24h)",
+                f"{dashboard['combined_total']:,}",
+                f"{dashboard['feeds_online']}/{dashboard['feeds_total']} feeds online",
+            )
         with c2:
-            st.metric("Countries in watchlist", df_cholera.shape[0])
+            st.metric("Countries on watchlist", df_cholera.shape[0])
         with c3:
-            st.metric("Signal mentions (24h)", f"{int(realtime_data.get('news_mentions', 0)):,}")
+            st.metric(
+                "GDELT mentions (24h)",
+                f"{dashboard['news_mentions']:,}",
+                f"Signal {dashboard['signal_score']}/100",
+            )
 
-        fig_cholera = px.choropleth(
-            df_cholera,
-            locations="iso_code",
-            color="cholera_cases_sim",
-            hover_name="location",
-            color_continuous_scale="YlOrRd",
-            title="Global outbreak discussion heatmap (illustrative intensity view)",
+        if base_signal == 0:
+            st.info(
+                "Choropleth is empty because no live feed returned signals in the current snapshot. "
+                "Try refreshing or check the Source Monitor tab for feed connectivity."
+            )
+        else:
+            fig_cholera = px.choropleth(
+                df_cholera,
+                locations="iso_code",
+                color="signal_share",
+                hover_name="location",
+                hover_data={"iso_code": False, "signal_share": ":,"},
+                color_continuous_scale="YlOrRd",
+                title="Regional share of combined live signal volume (24h)",
+            )
+            fig_cholera.update_layout(
+                legend_title_text="Share of live signal volume",
+                transition={"duration": 420, "easing": "cubic-in-out"},
+            )
+            st.plotly_chart(fig_cholera, use_container_width=True)
+        st.caption(
+            "Distribution above uses transparent regional watch weights applied to the live combined "
+            "signal volume — district case totals are not synthesized."
         )
-        fig_cholera.update_layout(
-            legend_title_text="Outbreak discussion intensity",
-            transition={"duration": 420, "easing": "cubic-in-out"},
-        )
-        st.plotly_chart(fig_cholera, use_container_width=True)
 
     with tab2:
         disease = st.session_state.get("policy_disease", "Cholera")
@@ -663,9 +1119,9 @@ def render_global_view(realtime_data):
         st.subheader("Feed Quality and Freshness")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Signal mentions (24h)", f"{int(realtime_data.get('news_mentions', 0)):,}")
+            st.metric("Signal mentions (24h)", f"{dashboard['news_mentions']:,}")
         with c2:
-            st.metric("Countries in active watch", int(realtime_data.get("affected_countries", 0)))
+            st.metric("Countries in active watch", dashboard["affected_countries"])
         with c3:
             st.metric("Feed update time", realtime_data.get("last_updated", "n/a"))
 
@@ -687,49 +1143,116 @@ def render_global_view(realtime_data):
             st.success("NewsAPI: online (key present)")
         else:
             st.info("NewsAPI: optional (set NEWSAPI_KEY for headline volume)")
+        if realtime_data.get("who_ok"):
+            st.success("WHO feed: online")
+        else:
+            st.warning("WHO feed: unavailable (using 0 count)")
+        if realtime_data.get("cdc_ok"):
+            st.success("CDC feed: online")
+        else:
+            st.warning("CDC feed: unavailable (using 0 count)")
+        if realtime_data.get("un_ok"):
+            st.success("UN Global Health signal: online")
+        else:
+            st.warning("UN Global Health signal: unavailable")
+        if realtime_data.get("x_ok"):
+            st.success("X / Twitter API: online")
+        else:
+            st.info(f"X / Twitter API: {realtime_data.get('x_status', 'not configured')}")
+        if realtime_data.get("linkedin_ok"):
+            st.success("LinkedIn API: online")
+        else:
+            st.info(f"LinkedIn API: {realtime_data.get('linkedin_status', 'not configured')}")
+        if realtime_data.get("meta_ok"):
+            st.success("Facebook/Meta API: online")
+        else:
+            st.info(f"Facebook/Meta API: {realtime_data.get('meta_status', 'not configured')}")
         st.info("AI extraction: POST /v1/nlp-alerts or direct OpenAI-compatible chat from env keys.")
+
+        st.markdown("### 🔗 Where each signal came from (live source links)")
+        st.caption(
+            "Each metric on this page traces back to these feed items — click any title to open the "
+            "original article or post on the source site."
+        )
+        render_signal_sources_panel(realtime_data, key_suffix="global")
 
 
 def render_executive_brief(realtime_data):
     st.title("🧭 Executive Briefing")
     st.caption("One-screen summary for senior decision makers: status, priorities, and immediate actions.")
 
-    signal_score = min(100, 35 + int(realtime_data["news_mentions"]) // 80)
-    outbreak_risk = min(0.98, signal_score / 100)
-    risk_label, _ = _risk_level(outbreak_risk)
+    dashboard = get_dashboard(realtime_data)
+    signal_score = dashboard["signal_score"]
+    risk_label = dashboard["risk_level"]
+    posture = dashboard["posture"]
 
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        st.metric("Overall risk level", risk_label)
+        st.metric("Overall risk level", risk_label, posture)
     with k2:
         st.metric("Signal intensity", f"{signal_score}/100")
     with k3:
-        st.metric("Countries under watch", int(realtime_data.get("affected_countries", 0)))
+        st.metric("Countries under watch", dashboard["affected_countries"])
     with k4:
         st.metric("Update time", realtime_data.get("last_updated", "n/a"))
 
     st.info(
-        f"**National posture:** {risk_label} risk. "
-        f"Maintain daily incident command review and district-level escalation checks."
+        f"**National posture:** {risk_label} risk · {posture} stance · "
+        f"recommended response window {dashboard['response_window']}."
     )
+
+    social_channels = realtime_data.get("social_channels") or {}
+    health_channels = realtime_data.get("health_site_signals") or {}
+    top_social = sorted(social_channels.items(), key=lambda x: int(x[1] or 0), reverse=True)[:3]
+    top_health = sorted(health_channels.items(), key=lambda x: int(x[1] or 0), reverse=True)[:2]
 
     left, right = st.columns([1.3, 1])
     with left:
-        st.subheader("Incident Timeline (Last 7 Days)")
-        timeline = pd.DataFrame(
-            [
-                {"Day": "D-6", "Event": "Signal growth detected in regional media", "Priority": "Medium"},
-                {"Day": "D-5", "Event": "Border-adjacent district chatter increased", "Priority": "High"},
-                {"Day": "D-3", "Event": "Rapid review triggered for surveillance team", "Priority": "High"},
-                {"Day": "D-2", "Event": "Commodity check initiated for treatment stocks", "Priority": "Medium"},
-                {"Day": "D-1", "Event": "Situation brief prepared for leadership", "Priority": "Low"},
-                {"Day": "Today", "Event": "Action plan refreshed with current disease profile", "Priority": risk_label},
-            ]
-        )
+        st.subheader("Current Signal Register")
+        timeline_rows = [
+            {
+                "Window": "24h",
+                "Event": f"GDELT outbreak mentions recorded: {dashboard['news_mentions']:,}",
+                "Priority": "High" if dashboard["news_mentions"] >= 2000 else "Medium",
+            },
+            {
+                "Window": "24h",
+                "Event": f"Open-web volume total: {dashboard['open_web_total']:,}",
+                "Priority": "High" if dashboard["open_web_total"] >= 3000 else "Medium",
+            },
+            {
+                "Window": "24h",
+                "Event": f"Official health feed volume: {dashboard['official_total']:,}",
+                "Priority": "High" if dashboard["official_total"] >= 80 else "Low",
+            },
+            {
+                "Window": "Now",
+                "Event": f"Latest snapshot captured at {realtime_data.get('last_updated', 'n/a')}",
+                "Priority": risk_label,
+            },
+        ]
+        for label, value in top_social:
+            timeline_rows.append(
+                {
+                    "Window": "Source",
+                    "Event": f"{label}: {int(value or 0):,}",
+                    "Priority": "Medium",
+                }
+            )
+        for label, value in top_health:
+            timeline_rows.append(
+                {
+                    "Window": "Source",
+                    "Event": f"{label}: {int(value or 0):,}",
+                    "Priority": "Low",
+                }
+            )
+
+        timeline = pd.DataFrame(timeline_rows[:8])
         st.dataframe(timeline, use_container_width=True, hide_index=True)
 
     with right:
-        st.subheader("Decision Actions (24-72h)")
+        st.subheader(f"Decision Actions ({dashboard['response_window']})")
         st.error("P1 • Confirm hotspot districts and activate response leads.")
         st.warning("P2 • Verify procurement buffer for diagnostics and therapeutics.")
         st.info("P3 • Publish synchronized risk communication guidance.")
@@ -737,6 +1260,13 @@ def render_executive_brief(realtime_data):
         st.checkbox("Incident command meeting scheduled", key="exec_meeting")
         st.checkbox("Border screening protocol reviewed", key="exec_border")
         st.checkbox("District stock report validated", key="exec_stock")
+
+    st.markdown("### 🔗 Where each signal came from (live source links)")
+    st.caption(
+        "Each KPI above traces back to these feed items — click any title to open the original "
+        "article or post on the source site."
+    )
+    render_signal_sources_panel(realtime_data, key_suffix="exec")
 
 
 def render_roi_financing():

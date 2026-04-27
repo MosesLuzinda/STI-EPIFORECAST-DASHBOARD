@@ -1,5 +1,10 @@
 import asyncio
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 import json
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.error import HTTPError, URLError
