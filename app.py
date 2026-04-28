@@ -935,7 +935,9 @@ def get_malaria_uganda_data_resilient():
 
 def get_outbreak_data_resilient():
     started = time.perf_counter()
-    data = fetch_realtime_outbreak_data()
+    # Cache hits return immediately (no visible wait). Cold fetch shows a short, friendly line.
+    with st.spinner("Preparing your dashboard…"):
+        data = fetch_realtime_outbreak_data()
     st.session_state["feed_snapshots"]["outbreak"] = data
     mark_feed_success("outbreak")
     record_feed_latency("outbreak", (time.perf_counter() - started) * 1000)

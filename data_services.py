@@ -39,7 +39,7 @@ def read_csv_with_retry(url: str, attempts: int = 3, timeout_sec: int = 20):
     raise RuntimeError(f"Failed to load CSV from {url}: {last_error}")
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading real malaria data for Uganda...")
+@st.cache_data(ttl=3600, show_spinner="Loading public health data…")
 def load_malaria_uganda_real():
     url = "https://ourworldindata.org/grapher/death-rate-from-malaria.csv"
     df = read_csv_with_retry(url)
@@ -568,10 +568,10 @@ def _fetch_meta_signal_count(timeout_sec: float = 8) -> tuple[int, bool, str]:
         return 0, False, str(exc)[:120]
 
 
-@st.cache_data(ttl=180, show_spinner="Refreshing outbreak + open-web feeds...")
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_realtime_outbreak_data():
     """
-    Short-TTL snapshot (~30s cache). Mixes:
+    Short-TTL snapshot (default 5 min cache; see ttl). Mixes:
     - GDELT: news article volume (24h).
     - Reddit public search, Hacker News (Algolia): real post/story counts (24h windows).
     - NewsAPI: optional when NEWSAPI_KEY is set.
@@ -1012,7 +1012,7 @@ def _ai_env_credentials():
     return api_key, base_url, model
 
 
-@st.cache_data(ttl=120, show_spinner="Generating AI NLP alert summaries...")
+@st.cache_data(ttl=120, show_spinner="Generating alerts…")
 def generate_ai_nlp_alerts(
     disease: str,
     news_mentions: int,
@@ -1362,7 +1362,7 @@ def _normalize_vdtec_df(frame: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=180, show_spinner="Building VDTEC countermeasure rows...")
+@st.cache_data(ttl=180, show_spinner="Loading countermeasures…")
 def generate_pe_countermeasures_rows(
     host: str,
     disease: str,
@@ -1494,7 +1494,7 @@ def _standardize_incidents_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=900, show_spinner="Loading incidents dataset...")
+@st.cache_data(ttl=900, show_spinner="Loading incident file…")
 def load_disease_incidents_excel(excel_path: str) -> pd.DataFrame:
     df = pd.read_excel(excel_path)
     df = _standardize_incidents_columns(df)
