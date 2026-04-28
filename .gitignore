@@ -7,5 +7,7 @@ mobile-app/node_modules/
 .expo/
 .streamlit/secrets.toml
 uploads/
+# Local admin email / alert settings
+admin_alerts_config.json
 # Local SQLite signal store (do not commit)
 data/*.db
