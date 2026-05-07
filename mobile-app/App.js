@@ -104,7 +104,7 @@ export default function App() {
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
       <ScrollView style={styles.root} contentContainerStyle={styles.container}>
-        <Text style={styles.title}>STI-EPI-FORECAST</Text>
+        <Text style={styles.title}>Pathogen Economy Epiforecast</Text>
         <Text style={styles.subtitle}>Uganda epidemic early warning dashboard (mobile prototype)</Text>
 
         <View style={styles.card}>

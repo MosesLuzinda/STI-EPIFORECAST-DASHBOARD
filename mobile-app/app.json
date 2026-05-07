@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "STI-EPI-FORECAST",
-    "slug": "sti-epi-forecast",
+    "name": "Pathogen Economy Epiforecast",
+    "slug": "pathogen-economy-epiforecast",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",

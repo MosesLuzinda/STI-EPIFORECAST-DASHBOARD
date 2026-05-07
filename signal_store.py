@@ -36,8 +36,21 @@ from pathlib import Path
 
 import pandas as pd
 
+# Always resolve the default DB to this package directory (project root), not
+# the process current working directory — so `streamlit run` from any folder
+# still shares one `data/signals.db` and live/validated signal counts match.
+_ROOT = Path(__file__).resolve().parent
 
-DB_PATH = Path(os.getenv("SIGNAL_DB_PATH", "data/signals.db"))
+
+def _resolved_db_path() -> Path:
+    raw = (os.getenv("SIGNAL_DB_PATH") or "data/signals.db").strip()
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return (_ROOT / p).resolve()
+
+
+DB_PATH = _resolved_db_path()
 
 _init_lock = threading.Lock()
 _initialized = False

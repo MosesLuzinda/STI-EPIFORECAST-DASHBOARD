@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from ai_config import chat_text_from_prompts, openai_compatible_env_credentials
 from signal_validator import validate_signals_batch, keyword_relevant
 from signal_store import (
     append_signals as _persist_signals,
@@ -22,6 +23,12 @@ from signal_store import (
     list_diseases as _list_signal_diseases,
 )
 
+# Must match @st.cache_data(ttl=…) on fetch_realtime_outbreak_data.
+OUTBREAK_SNAPSHOT_TTL_SEC = 300
+DEFAULT_HTTP_TIMEOUT_SEC = 12
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.headers.update({"User-Agent": "PathogenEconomyEpiforecast/1.0 (Pathogen Economy Epiforecast; +https://github.com)"})
+
 ADMIN_ALERTS_FILE = Path("admin_alerts_config.json")
 
 
@@ -29,7 +36,7 @@ def read_csv_with_retry(url: str, attempts: int = 3, timeout_sec: int = 20):
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
-            response = requests.get(url, timeout=timeout_sec, headers={"User-Agent": "Mozilla/5.0"})
+            response = _HTTP_SESSION.get(url, timeout=timeout_sec, headers={"User-Agent": "Mozilla/5.0"})
             response.raise_for_status()
             return pd.read_csv(StringIO(response.text))
         except Exception as exc:
@@ -63,7 +70,20 @@ def load_malaria_uganda_real():
 
 
 def _http_headers():
-    return {"User-Agent": "STI-EpiForecast/1.0 (Pathogen Economy dashboard; +https://github.com)"}
+    return {"User-Agent": "PathogenEconomyEpiforecast/1.0 (Pathogen Economy Epiforecast; +https://github.com)"}
+
+
+def _http_get(
+    url: str,
+    *,
+    timeout_sec: float = DEFAULT_HTTP_TIMEOUT_SEC,
+    params: dict | None = None,
+    extra_headers: dict | None = None,
+):
+    headers = _http_headers()
+    if extra_headers:
+        headers.update(extra_headers)
+    return _HTTP_SESSION.get(url, params=params, timeout=timeout_sec, headers=headers)
 
 
 def _fetch_gdelt_hits(timeout_sec: float = 20) -> tuple[int, bool]:
@@ -78,7 +98,7 @@ def _fetch_gdelt_hits(timeout_sec: float = 20) -> tuple[int, bool]:
             "query=cholera+OR+malaria+OR+outbreak+OR+epidemic&"
             "mode=ArtList&maxrecords=250&format=json&timespan=1d&sort=datedesc"
         )
-        r = requests.get(url, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return 0, False
         articles = r.json().get("articles") or []
@@ -92,7 +112,7 @@ def _fetch_reddit_recent_count(timeout_sec: float = 7) -> tuple[int, bool]:
     try:
         url = "https://www.reddit.com/search.json"
         params = {"q": "cholera OR malaria OR outbreak OR cholera uganda", "sort": "new", "t": "day", "limit": 100}
-        r = requests.get(url, params=params, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, params=params, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return 0, False
         children = r.json().get("data", {}).get("children") or []
@@ -106,7 +126,7 @@ def _fetch_reddit_recent_items(limit: int = 8, timeout_sec: float = 7) -> tuple[
     try:
         url = "https://www.reddit.com/search.json"
         params = {"q": "cholera OR malaria OR outbreak OR cholera uganda", "sort": "new", "t": "day", "limit": max(3, int(limit))}
-        r = requests.get(url, params=params, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, params=params, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return [], False
         children = r.json().get("data", {}).get("children") or []
@@ -154,7 +174,7 @@ def _fetch_hn_algolia_hits(timeout_sec: float = 7) -> tuple[int, bool]:
             "tags": "story",
             "numericFilters": f"created_at_i>{since}",
         }
-        r = requests.get(url, params=params, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, params=params, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return 0, False
         nb = int(r.json().get("nbHits", 0) or 0)
@@ -173,7 +193,7 @@ def _fetch_hn_recent_items(limit: int = 6, timeout_sec: float = 7) -> tuple[list
             "numericFilters": f"created_at_i>{since}",
             "hitsPerPage": max(3, int(limit)),
         }
-        r = requests.get(url, params=params, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, params=params, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return [], False
         hits = r.json().get("hits") or []
@@ -243,7 +263,7 @@ def _fetch_gdelt_domain_hits(domain: str, timeout_sec: float = 15) -> tuple[int,
             f"query=(cholera+OR+malaria+OR+outbreak+OR+epidemic)+domain:{domain}&"
             "mode=ArtList&maxrecords=250&format=json&timespan=1d"
         )
-        r = requests.get(url, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return 0, False
         articles = r.json().get("articles") or []
@@ -329,7 +349,7 @@ def _fetch_who_outbreak_news_count(timeout_sec: float = 10) -> tuple[int, bool]:
     any_ok = False
     for feed_url in feeds:
         try:
-            r = requests.get(feed_url, timeout=timeout_sec, headers=_http_headers())
+            r = _http_get(feed_url, timeout_sec=timeout_sec)
             if r.status_code != 200 or not r.text.strip():
                 continue
             any_ok = True
@@ -358,7 +378,7 @@ def _fetch_rss_items(
     signal store for the signal-trained forecast model).
     """
     try:
-        r = requests.get(feed_url, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(feed_url, timeout_sec=timeout_sec)
         if r.status_code != 200 or not r.text.strip():
             return [], False
         root = ET.fromstring(r.text)
@@ -424,7 +444,7 @@ def _fetch_rss_count(
 ) -> tuple[int, bool]:
     """Lightweight RSS counter that only keeps outbreak-relevant items."""
     try:
-        r = requests.get(feed_url, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(feed_url, timeout_sec=timeout_sec)
         if r.status_code != 200 or not r.text.strip():
             return 0, False
         root = ET.fromstring(r.text)
@@ -464,7 +484,7 @@ def _fetch_gdelt_top_articles(max_records: int = 10, timeout_sec: float = 20) ->
             "query=cholera+OR+malaria+OR+outbreak+OR+epidemic&"
             f"mode=ArtList&maxrecords={int(max_records)}&format=json&timespan=1d&sort=datedesc"
         )
-        r = requests.get(url, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return [], False
         articles = r.json().get("articles") or []
@@ -511,12 +531,7 @@ def _fetch_x_signal_count(timeout_sec: float = 8) -> tuple[int, bool, str]:
     try:
         url = "https://api.twitter.com/2/tweets/search/recent"
         params = {"query": "cholera OR malaria OR outbreak lang:en", "max_results": 10}
-        r = requests.get(
-            url,
-            params=params,
-            timeout=timeout_sec,
-            headers={"Authorization": f"Bearer {token}", **_http_headers()},
-        )
+        r = _http_get(url, params=params, timeout_sec=timeout_sec, extra_headers={"Authorization": f"Bearer {token}"})
         if r.status_code != 200:
             return 0, False, f"http {r.status_code}"
         data = r.json().get("data") or []
@@ -535,12 +550,7 @@ def _fetch_linkedin_signal_count(timeout_sec: float = 8) -> tuple[int, bool, str
     try:
         url = "https://api.linkedin.com/v2/shares"
         params = {"q": "owners", "owners": f"urn:li:organization:{org}", "count": 10}
-        r = requests.get(
-            url,
-            params=params,
-            timeout=timeout_sec,
-            headers={"Authorization": f"Bearer {token}", **_http_headers()},
-        )
+        r = _http_get(url, params=params, timeout_sec=timeout_sec, extra_headers={"Authorization": f"Bearer {token}"})
         if r.status_code != 200:
             return 0, False, f"http {r.status_code}"
         elems = r.json().get("elements") or []
@@ -559,7 +569,7 @@ def _fetch_meta_signal_count(timeout_sec: float = 8) -> tuple[int, bool, str]:
     try:
         url = f"https://graph.facebook.com/v20.0/{page_id}/posts"
         params = {"limit": 10, "access_token": token}
-        r = requests.get(url, params=params, timeout=timeout_sec, headers=_http_headers())
+        r = _http_get(url, params=params, timeout_sec=timeout_sec)
         if r.status_code != 200:
             return 0, False, f"http {r.status_code}"
         data = r.json().get("data") or []
@@ -568,7 +578,7 @@ def _fetch_meta_signal_count(timeout_sec: float = 8) -> tuple[int, bool, str]:
         return 0, False, str(exc)[:120]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=OUTBREAK_SNAPSHOT_TTL_SEC, show_spinner=False)
 def fetch_realtime_outbreak_data():
     """
     Short-TTL snapshot (default 5 min cache; see ttl). Mixes:
@@ -733,6 +743,7 @@ def fetch_realtime_outbreak_data():
             "ReliefWeb + PAHO (official health) — all live, real signal counts only."
         ),
         "last_updated": datetime.now().strftime("%H:%M:%S EAT"),
+        "snapshot_utc": datetime.now(timezone.utc).isoformat(),
         "gdelt_ok": gdelt_ok,
         "reddit_ok": reddit_ok,
         "hackernews_ok": hn_ok,
@@ -966,7 +977,68 @@ def compute_dashboard_metrics(realtime_data: dict) -> dict:
             "official": round(official_component, 1),
             "reliability": round(reliability_component, 1),
         },
+        "validated_signals_24h": int(realtime_data.get("validated_signals_24h", 0) or 0),
+        "snapshot_utc": str(realtime_data.get("snapshot_utc") or ""),
     }
+
+
+_SOURCE_PRIORITY = {
+    "WHO News": 100,
+    "WHO Africa": 95,
+    "CDC": 92,
+    "UN Global Health": 90,
+    "PAHO": 86,
+    "CIDRAP": 84,
+    "ReliefWeb": 82,
+    "GDELT": 72,
+    "Hacker News": 58,
+    "Reddit": 55,
+}
+
+
+def _item_priority(item: dict) -> int:
+    source = str(item.get("source") or "").strip()
+    meta = str(item.get("meta") or "").strip().lower()
+    base = _SOURCE_PRIORITY.get(source, 50)
+    if "official" in meta:
+        base += 10
+    if "who" in meta or "cdc" in meta:
+        base += 6
+    # Prefer entries that have destinations users can click through.
+    if str(item.get("url") or "").strip():
+        base += 2
+    return base
+
+
+def _dedupe_and_rank_signal_items(items: list[dict], *, limit: int = 30) -> list[dict]:
+    """
+    Remove duplicate feed items and rank by source reliability priority.
+    """
+    best_by_key: dict[str, tuple[int, dict]] = {}
+    for raw in items or []:
+        item = {
+            "source": str(raw.get("source") or "Source"),
+            "title": str(raw.get("title") or "Untitled signal"),
+            "url": str(raw.get("url") or "").strip(),
+            "meta": str(raw.get("meta") or ""),
+        }
+        key = (item["url"] or item["title"]).strip().lower()
+        if not key:
+            continue
+        score = _item_priority(item)
+        current = best_by_key.get(key)
+        if score >= 90:
+            confidence = "High"
+        elif score >= 70:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+        item["confidence"] = confidence
+        item["source_score"] = score
+        if current is None or score > current[0]:
+            best_by_key[key] = (score, item)
+    ranked = sorted(best_by_key.values(), key=lambda entry: (-entry[0], entry[1]["source"], entry[1]["title"]))
+    return [item for _, item in ranked[: max(1, int(limit))]]
 
 
 def get_signal_sources(realtime_data: dict) -> dict:
@@ -975,8 +1047,8 @@ def get_signal_sources(realtime_data: dict) -> dict:
     {source, title, url, meta}, so any page can render clickable signal links
     next to its KPIs.
     """
-    open_web = list(realtime_data.get("open_web_cases") or [])
-    official = list(realtime_data.get("official_cases") or [])
+    open_web = _dedupe_and_rank_signal_items(list(realtime_data.get("open_web_cases") or []), limit=30)
+    official = _dedupe_and_rank_signal_items(list(realtime_data.get("official_cases") or []), limit=30)
     news = list(realtime_data.get("news_links") or [])
     news_normalized = [
         {
@@ -987,29 +1059,13 @@ def get_signal_sources(realtime_data: dict) -> dict:
         }
         for n in news
     ]
+    news_ranked = _dedupe_and_rank_signal_items(news_normalized, limit=30)
     return {
         "open_web": open_web,
         "official": official,
-        "news": news_normalized,
+        "news": news_ranked,
         "portals": realtime_data.get("source_links") or {},
     }
-
-
-def _ai_env_credentials():
-    api_key = (
-        os.getenv("CURSOR_API_KEY")
-        or os.getenv("AI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("XAI_API_KEY")
-    )
-    base_url = (
-        os.getenv("CURSOR_API_BASE_URL")
-        or os.getenv("AI_BASE_URL")
-        or os.getenv("OPENAI_BASE_URL")
-        or "https://api.openai.com/v1"
-    ).rstrip("/")
-    model = os.getenv("CURSOR_AI_MODEL") or os.getenv("AI_MODEL") or "gpt-4o-mini"
-    return api_key, base_url, model
 
 
 @st.cache_data(ttl=120, show_spinner="Generating alerts…")
@@ -1055,7 +1111,7 @@ def generate_ai_nlp_alerts(
     except Exception:
         pass
 
-    api_key, base_url, model = _ai_env_credentials()
+    api_key, base_url, model = openai_compatible_env_credentials()
     if not api_key:
         return fallback_alerts, "fallback"
 
@@ -1073,24 +1129,15 @@ def generate_ai_nlp_alerts(
     )
 
     try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.3,
-            },
-            timeout=20,
+        text, err = chat_text_from_prompts(
+            system_prompt,
+            user_prompt,
+            temperature=0.3,
+            timeout_sec=20,
+            model=model,
         )
-        response.raise_for_status()
-        text = response.json()["choices"][0]["message"]["content"]
+        if not text:
+            raise RuntimeError(err or "no assistant content")
         lines = [line.strip("- ").strip() for line in text.splitlines() if line.strip()]
         cleaned = []
         for line in lines:
@@ -1152,10 +1199,20 @@ def _parse_utc_iso(value: str):
 
 
 def _smtp_env():
+    sendgrid = (os.getenv("SENDGRID_API_KEY") or "").strip()
     host = os.getenv("SMTP_HOST", "").strip()
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER", "").strip()
-    password = os.getenv("SMTP_PASS", "").strip()
+    raw_port = os.getenv("SMTP_PORT", "587")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        port = 587
+    if sendgrid and not host:
+        host = "smtp.sendgrid.net"
+        user = "apikey"
+        password = sendgrid
+    else:
+        user = os.getenv("SMTP_USER", "").strip()
+        password = (os.getenv("SMTP_PASS") or "").strip()
     sender = os.getenv("ALERT_FROM_EMAIL", user).strip()
     use_tls = os.getenv("SMTP_USE_TLS", "1").strip().lower() in {"1", "true", "yes"}
     return host, port, user, password, sender, use_tls
@@ -1208,7 +1265,7 @@ def build_admin_update_message(realtime_data: dict, risk: dict) -> str:
     )
     top_alerts = "\n".join(f"- {line}" for line in alerts[:3])
     return (
-        "STI-EpiForecast App — Risk Update\n\n"
+        "Pathogen Economy Epiforecast — Risk Update\n\n"
         f"Time (UTC): {_utc_now_iso()}\n"
         f"Risk level: {risk['risk_level']} ({risk['risk_score']}/100)\n"
         f"Signal mentions (24h): {risk['mentions']:,}\n"
@@ -1242,7 +1299,7 @@ def evaluate_and_send_admin_notifications(realtime_data: dict) -> dict:
     )
     if due_daily:
         ok, msg = send_admin_email(
-            subject=f"[Daily] STI-EpiForecast {risk['risk_level']} risk",
+            subject=f"[Daily] Pathogen Economy Epiforecast {risk['risk_level']} risk",
             body_text=body,
             recipients=recipients,
         )
@@ -1273,30 +1330,17 @@ def evaluate_and_send_admin_notifications(realtime_data: dict) -> dict:
 
 
 def _ai_chat_text(system_prompt: str, user_prompt: str, temperature: float = 0.25, timeout_sec: float = 35) -> str | None:
-    api_key, base_url, model = _ai_env_credentials()
+    api_key, _, model = openai_compatible_env_credentials()
     if not api_key:
         return None
-    try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": temperature,
-            },
-            timeout=timeout_sec,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return None
+    text, _ = chat_text_from_prompts(
+        system_prompt,
+        user_prompt,
+        temperature=temperature,
+        timeout_sec=timeout_sec,
+        model=model,
+    )
+    return text.strip() if text else None
 
 
 def _vdtec_fallback_catalog(host: str, disease: str, condition_class: str) -> list[dict]:

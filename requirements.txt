@@ -11,3 +11,4 @@ folium
 streamlit-folium
 openpyxl
 scikit-learn
+python-docx

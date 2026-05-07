@@ -19,6 +19,14 @@ from data_services import (
     save_admin_alert_config,
     send_admin_email,
 )
+from forecast_lab_four_disease import (
+    brief_to_burden_df,
+    brief_to_heatmap_df,
+    brief_to_radar_figure,
+    generate_four_disease_brief_json,
+    recommendations_to_rows,
+    uganda_units_to_rows,
+)
 
 
 def get_dashboard(realtime_data: dict | None) -> dict:
@@ -51,11 +59,13 @@ def render_signal_sources_panel(realtime_data: dict, *, key_suffix: str = "", de
             url = str(item.get("url") or "").strip()
             source = str(item.get("source") or "Source")
             meta = str(item.get("meta") or "")
+            confidence = str(item.get("confidence") or "").strip()
+            badge = f" · `{confidence}` confidence" if confidence else ""
             suffix = f" — _{meta}_" if meta else ""
             if url:
-                st.markdown(f"{idx}. [{title}]({url}) · **{source}**{suffix}")
+                st.markdown(f"{idx}. [{title}]({url}) · **{source}**{badge}{suffix}")
             else:
-                st.markdown(f"{idx}. {title} · **{source}**{suffix}")
+                st.markdown(f"{idx}. {title} · **{source}**{badge}{suffix}")
 
     tab_labels = ["Open-web items", "Official feeds", "GDELT articles", "Source portals"]
     tabs = st.tabs(tab_labels)
@@ -240,6 +250,96 @@ def render_forecast_lab(realtime_data: dict | None = None):
         "Structured workflow: tune epidemiological assumptions, review transmission dynamics, "
         "then validate ML outputs with incident history and live signal blending."
     )
+
+    st.subheader("AI four-disease public-health planning brief (Uganda)")
+    st.caption(
+        "Targets **Cholera, Malaria, Typhoid, and Marburg** with **causal domains** (environment, climate, "
+        "WASH, vectors, movement, border, health system) plus **Uganda** districts/subcounties and **EAC** context, "
+        "**relative** burden and forward indices, and **recommendations**. Synthesis is for early warning and planning — "
+        "calibrate to MoH, DHIS2, and EOC. Requires an AI key (see `.env` / host secrets)."
+    )
+    c_run, c_clr, c_ht = st.columns([1.25, 0.55, 1.0])
+    with c_run:
+        if st.button("🧠 Generate 4-disease analysis & visual comparison", type="primary", key="fl4_run"):
+            with st.spinner("AI cross-disease analysis (up to ~2 min)…"):
+                st.session_state["fl4_result"] = generate_four_disease_brief_json(realtime_data or {})
+    with c_clr:
+        if st.button("Clear", key="fl4_clear"):
+            st.session_state.pop("fl4_result", None)
+    with c_ht:
+        st.caption("Uses current **dashboard snapshot** (signals, feeds) + model estimates **0–100** (not case counts).")
+
+    fl4 = st.session_state.get("fl4_result")
+    if fl4 is not None:
+        if not fl4.get("ok"):
+            st.error(str(fl4.get("error") or "AI brief failed."))
+            if fl4.get("raw_excerpt"):
+                with st.expander("Model output (debug, truncated)"):
+                    st.text(str(fl4["raw_excerpt"])[:4000])
+        else:
+            br = (fl4.get("brief") or {}) if isinstance(fl4.get("brief"), dict) else {}
+            st.markdown("#### Executive summary")
+            st.markdown(str(br.get("executive_summary") or "_—_"))
+            t_a, t_b, t_c, t_d = st.tabs(
+                ["Causal structure (heatmap & radar)", "Burden, forecast index & subnational", "EAC + recommendations", "Caveats"]
+            )
+            with t_a:
+                hdf = brief_to_heatmap_df(br)
+                fig_heat = px.imshow(
+                    hdf,
+                    zmin=0,
+                    zmax=100,
+                    color_continuous_scale="YlOrRd",
+                    aspect="auto",
+                    labels=dict(
+                        x="Causal / system domain (model index, not absolute risk)",
+                        y="Disease",
+                        color="0–100",
+                    ),
+                    title="Causal & driver index matrix — 4 priority diseases, 9 domains",
+                )
+                fig_heat.update_layout(template="plotly_dark")
+                st.plotly_chart(fig_heat, use_container_width=True)
+                st.plotly_chart(brief_to_radar_figure(br), use_container_width=True)
+                nrs = br.get("disease_narrative")
+                if isinstance(nrs, dict):
+                    for dname, txt in nrs.items():
+                        with st.expander(f"{dname} — short narrative (causal + Uganda)", expanded=False):
+                            st.write(str(txt))
+            with t_b:
+                bdf = brief_to_burden_df(br)
+                melt = bdf.melt(
+                    id_vars="Disease",
+                    value_vars=[c for c in bdf.columns if c != "Disease"],
+                    var_name="Metric",
+                    value_name="0–100",
+                )
+                fig_bar = px.bar(
+                    melt,
+                    x="Disease",
+                    y="0–100",
+                    color="Metric",
+                    barmode="group",
+                    title="Comparative burden and 6‑month relative forecast index (planning scale 0–100; not case counts)",
+                )
+                fig_bar.update_layout(template="plotly_dark")
+                st.plotly_chart(fig_bar, use_container_width=True)
+                urows = uganda_units_to_rows(br)
+                if urows:
+                    st.markdown("**Uganda: districts / subcounties / regions (draft targeting)**")
+                    st.dataframe(pd.DataFrame(urows), use_container_width=True, hide_index=True)
+            with t_c:
+                st.markdown("**East Africa / border context**")
+                st.markdown(str(br.get("eac_regional_patterns") or "_—_"))
+                st.markdown("**Prioritized decision recommendations (evidence-style)**")
+                rrows = recommendations_to_rows(br)
+                if rrows:
+                    st.dataframe(pd.DataFrame(rrows), use_container_width=True, hide_index=True)
+            with t_d:
+                st.warning(str(br.get("evidence_caveat") or "AI output is a planning aid, not official surveillance."))
+                st.info(str(br.get("data_limitations") or "—"))
+
+    st.divider()
     disease = _selected_disease()
 
     in1, in2, in3, in4 = st.columns([1.2, 1.1, 1, 1.1])
@@ -375,12 +475,24 @@ def render_forecast_lab(realtime_data: dict | None = None):
     )
 
     st.subheader("Machine Learning Signal (AI-validated live signals + Random Forest)")
+    has_ai_key = bool(
+        (os.getenv("AI_API_KEY") or "").strip()
+        or (os.getenv("OPENAI_API_KEY") or "").strip()
+        or (os.getenv("CURSOR_API_KEY") or "").strip()
+        or (os.getenv("XAI_API_KEY") or "").strip()
+    )
     st.caption(
         "Forecast Lab now trains directly on the live signal stream. Every feed item "
         "(GDELT / Reddit / HN / WHO / CDC / CIDRAP / ReliefWeb / PAHO) is first run "
         "through the AI signal validator; only items confirmed as real outbreak signals "
         "are persisted to the signal store and used to train the model below."
     )
+    if not has_ai_key:
+        st.info(
+            "AI validation is currently in fallback mode because no API key is configured. "
+            "Set AI_API_KEY (or OPENAI_API_KEY / CURSOR_API_KEY / XAI_API_KEY) to unlock "
+            "full live signal validation and richer open-web signal items."
+        )
 
     available_diseases = list_validated_signal_diseases(min_count=1)
     disease_options = ["All diseases"] + available_diseases
@@ -567,7 +679,7 @@ def render_learning_hub():
         "- **Cholera & some KPIs**: simulated values based on plausible outbreak magnitudes, not official.\n"
         "- **HealthMap iframe**: external real-time map of infectious disease signals.[web:57][web:60]"
     )
-    st.markdown("#### How to go fully real for STI‑FORECAST")
+    st.markdown("#### How to go fully real for Pathogen Economy Epiforecast")
     st.markdown(
         "- Connect to MoH / DHIS2 APIs or CSV exports for district-level data.[web:73]\n"
         "- Use WHO GHO API for official cholera and malaria indicators.[web:90]\n"
@@ -834,6 +946,104 @@ def render_admin():
         "- MoH Uganda (DHIS2) API or CSV for district-level case data.[web:73]"
     )
 
+    st.markdown("#### Year‑1 operations stack (budget alignment)")
+    st.caption(
+        "Deployment checklist mapped to the 12‑month operational budget. "
+        "“Ready” means this host’s environment exposes the expected configuration — "
+        "not that billing or vendor contracts are complete."
+    )
+    primary_ai = bool(
+        (
+            os.getenv("AI_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("CURSOR_API_KEY")
+            or os.getenv("XAI_API_KEY")
+            or ""
+        ).strip()
+    )
+    failover_ai = bool((os.getenv("AI_FAILOVER_API_KEY") or os.getenv("GROQ_API_KEY") or "").strip())
+    email_ok = bool(
+        (os.getenv("SENDGRID_API_KEY") or "").strip()
+        or (
+            (os.getenv("SMTP_HOST") or "").strip()
+            and (os.getenv("ALERT_FROM_EMAIL") or os.getenv("SMTP_USER") or "").strip()
+            and (os.getenv("SMTP_PASS") or os.getenv("SENDGRID_API_KEY") or "").strip()
+        )
+    )
+    heartbeat = bool((os.getenv("BETTER_STACK_HEARTBEAT_URL") or os.getenv("UPTIME_HEARTBEAT_URL") or "").strip())
+    r2_ok = bool(
+        (os.getenv("R2_BUCKET_NAME") or os.getenv("CLOUDFLARE_R2_BUCKET") or "").strip()
+        and (os.getenv("R2_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID") or "").strip()
+    )
+    stack_df = pd.DataFrame(
+        [
+            {
+                "P": "P1",
+                "Budget item": "Domain registration",
+                "Vendor": "Cloudflare",
+                "In app / infra": "Public hostname (e.g. PathogenEconomyEpiforecast.com) + TLS certificates",
+                "Ready": "✓" if (os.getenv("PUBLIC_SITE_DOMAIN") or "").strip() else "—",
+            },
+            {
+                "P": "P1",
+                "Budget item": "DNS + WAF / CDN",
+                "Vendor": "Cloudflare",
+                "In app / infra": "Terminate TLS, DDoS protection, cache static assets in front of STI / Industry 4.0+ origin",
+                "Ready": "✓" if (os.getenv("CLOUDFLARE_ZONE_ID") or "").strip() else "—",
+            },
+            {
+                "P": "P1",
+                "Budget item": "AI primary",
+                "Vendor": "OpenAI",
+                "In app / infra": "Forecast Lab, NLP alerts, AI signal validation (`AI_*` / `OPENAI_*`)",
+                "Ready": "✓" if primary_ai else "—",
+            },
+            {
+                "P": "P2",
+                "Budget item": "AI failover",
+                "Vendor": "Groq",
+                "In app / infra": "Automatic failover for chat, validator, and API alerts (`AI_FAILOVER_*` or `GROQ_*`)",
+                "Ready": "✓" if failover_ai else "—",
+            },
+            {
+                "P": "P1",
+                "Budget item": "Transactional email",
+                "Vendor": "SendGrid",
+                "In app / infra": "Daily + emergency risk bulletins (`SENDGRID_API_KEY` or generic SMTP)",
+                "Ready": "✓" if email_ok else "—",
+            },
+            {
+                "P": "P1",
+                "Budget item": "Uptime + paging",
+                "Vendor": "Better Stack",
+                "In app / infra": "Synthetic checks against `/health` + on-call paging (heartbeat URL optional here)",
+                "Ready": "✓" if heartbeat else "—",
+            },
+            {
+                "P": "P2",
+                "Budget item": "Backup storage",
+                "Vendor": "Cloudflare R2",
+                "In app / infra": "Off-site copies of `signals.db`, uploads, configs (`R2_*` / S3-compatible)",
+                "Ready": "✓" if r2_ok else "—",
+            },
+            {
+                "P": "P1",
+                "Budget item": "App Builder license",
+                "Vendor": "ABQ",
+                "In app / infra": "Rapid UI / deployment layer alongside this Python codebase (trial tier Y1)",
+                "Ready": "✓" if (os.getenv("ABQ_PROJECT_ID") or "").strip() else "—",
+            },
+            {
+                "P": "P1",
+                "Budget item": "Technical staff",
+                "Vendor": "IT personnel (×2)",
+                "In app / infra": "Runbooks: monitor Better Stack, renew domain, rotate API keys, verify R2 backups",
+                "Ready": "—",
+            },
+        ]
+    )
+    st.dataframe(stack_df, use_container_width=True, hide_index=True)
+
     st.markdown("#### Admin risk email routing")
     cfg = load_admin_alert_config()
     enabled = st.toggle("Enable daily + emergency risk emails", value=bool(cfg.get("enabled", False)))
@@ -870,7 +1080,7 @@ def render_admin():
                 risk = analyze_outbreak_risk(test_data)
                 body = build_admin_update_message(test_data, risk)
                 ok, msg = send_admin_email(
-                    subject=f"[Test] STI-EpiForecast App {risk['risk_level']} risk bulletin",
+                    subject=f"[Test] Pathogen Economy Epiforecast {risk['risk_level']} risk bulletin",
                     body_text=body,
                     recipients=recipients,
                 )
@@ -879,8 +1089,9 @@ def render_admin():
                 else:
                     st.error(f"Test email failed: {msg}")
     st.caption(
-        "SMTP env vars required: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_FROM_EMAIL. "
-        "Emergency emails are triggered when computed risk exceeds threshold."
+        "Email delivery: set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_FROM_EMAIL — or only "
+        "SENDGRID_API_KEY (uses smtp.sendgrid.net / user `apikey`). "
+        "Emergency emails trigger when computed risk exceeds threshold."
     )
 
     st.markdown("#### API setup and live connectivity checks")
@@ -969,7 +1180,7 @@ def render_admin():
             r = requests.get(
                 "https://www.who.int/feeds/entity/emergencies/disease-outbreak-news/rss.xml",
                 timeout=8,
-                headers={"User-Agent": "STI-EpiForecast/1.0"},
+                headers={"User-Agent": "PathogenEconomyEpiforecast/1.0"},
             )
             if r.status_code != 200:
                 return False, f"HTTP {r.status_code}"
@@ -981,7 +1192,7 @@ def render_admin():
             r = requests.get(
                 "https://tools.cdc.gov/api/v2/resources/media/403372.rss",
                 timeout=8,
-                headers={"User-Agent": "STI-EpiForecast/1.0"},
+                headers={"User-Agent": "PathogenEconomyEpiforecast/1.0"},
             )
             if r.status_code != 200:
                 return False, f"HTTP {r.status_code}"
@@ -993,7 +1204,7 @@ def render_admin():
             r = requests.get(
                 "https://www.un.org",
                 timeout=8,
-                headers={"User-Agent": "STI-EpiForecast/1.0"},
+                headers={"User-Agent": "PathogenEconomyEpiforecast/1.0"},
             )
             if r.status_code != 200:
                 return False, f"HTTP {r.status_code}"

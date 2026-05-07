@@ -1,17 +1,43 @@
+import os
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load project root .env so OPENAI_API_KEY / AI_API_KEY / etc. are set before imports.
+# Load project root .env first so OPENAI_API_KEY / AI_API_KEY / etc. are set
+# before Streamlit and data_services are imported.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, timedelta
-import time
+
+
+def _merge_streamlit_secrets_into_environ() -> None:
+    """Mirror st.secrets (Cloud or .streamlit/secrets.toml) into os.environ; .env wins via setdefault."""
+    try:
+        # Missing secrets.toml locally raises StreamlitSecretNotFoundError (a FileNotFoundError).
+        mapping = dict(st.secrets)
+    except FileNotFoundError:
+        return
+    try:
+        for name, val in mapping.items():
+            if isinstance(val, dict):
+                for k, v in val.items():
+                    if v is not None and str(v).strip():
+                        os.environ.setdefault(str(k), str(v))
+            elif val is not None and str(val).strip():
+                os.environ.setdefault(str(name), str(val))
+    except (KeyError, TypeError, RuntimeError):
+        pass
+
+
+_merge_streamlit_secrets_into_environ()
+
 from data_services import (
+    OUTBREAK_SNAPSHOT_TTL_SEC,
     load_malaria_uganda_real,
     fetch_realtime_outbreak_data,
     evaluate_and_send_admin_notifications,
@@ -81,11 +107,11 @@ try:
     import folium
     from streamlit_folium import st_folium
     FOLIUM_OK = True
-except:
+except Exception:
     FOLIUM_OK = False
 
 # ---------------- PAGE CONFIG ----------------
-st.set_page_config(page_title="STI-EpiForecast App | Pathogen Economy", page_icon="🦠", layout="wide")
+st.set_page_config(page_title="Pathogen Economy Epiforecast", page_icon="🦠", layout="wide")
 
 st.markdown("""
 <style>
@@ -775,7 +801,7 @@ def render_top_navigation():
     with st.container(key="top_nav_shell"):
         header_l, header_r = st.columns([1.5, 1.5])
         with header_l:
-            st.markdown('<div class="top-nav-brand">STI EpiForecast</div>', unsafe_allow_html=True)
+            st.markdown('<div class="top-nav-brand">Pathogen Economy Epiforecast</div>', unsafe_allow_html=True)
         with header_r:
             st.markdown(f'<div class="top-nav-active-line">{active_group}: {selected_nav}</div>', unsafe_allow_html=True)
 
@@ -793,7 +819,7 @@ def render_top_navigation():
 
 
 def render_home_landing(realtime_data: dict):
-    st.title("STI-EpiForecast Platform")
+    st.title("Pathogen Economy Epiforecast")
     st.caption(
         "National epidemic intelligence for leadership, operations, and investment planning. "
         "Track live signals, quantify risk, and drive coordinated response decisions."
@@ -958,15 +984,17 @@ if retry_request == "malaria":
     load_malaria_uganda_real.clear()
     try:
         get_malaria_uganda_data_resilient()
-    except Exception:
-        pass
+    except Exception as exc:
+        increment_feed_retry("malaria")
+        record_feed_error("malaria", f"Retry failed: {exc}")
     st.session_state["retry_request"] = None
 elif retry_request == "outbreak":
     fetch_realtime_outbreak_data.clear()
     try:
         get_outbreak_data_resilient()
-    except Exception:
-        pass
+    except Exception as exc:
+        increment_feed_retry("outbreak")
+        record_feed_error("outbreak", f"Retry failed: {exc}")
     st.session_state["retry_request"] = None
 
 realtime_data = get_outbreak_data_resilient()
@@ -1039,7 +1067,10 @@ if "last_manual_refresh" not in st.session_state:
     st.session_state["last_manual_refresh"] = datetime.now()
 
 if st.sidebar.button("🔄 Refresh Live Feeds", key="refresh_live_feeds"):
-    st.cache_data.clear()
+    # Keep refresh targeted: clearing only relevant feed caches avoids evicting
+    # unrelated expensive page-level caches.
+    load_malaria_uganda_real.clear()
+    fetch_realtime_outbreak_data.clear()
     st.session_state["last_manual_refresh"] = datetime.now()
     st.rerun()
 
@@ -1118,6 +1149,21 @@ elif nav == "Reports library":
 elif nav == "Strategic signals":
     st.title("🌍 Strategic signals (national dashboard)")
     st.caption(f"🔄 {realtime_data['last_updated']} • {realtime_data['data_source']}")
+    _snap = (realtime_data.get("snapshot_utc") or "").strip()
+    if _snap:
+        st.caption(f"Snapshot (UTC): `{_snap}`")
+    with st.expander("Why numbers can differ from another tab, port, or Streamlit Cloud", expanded=False):
+        st.markdown(
+            f"""
+- **This page uses one shared fetch** for the current run. Open-web and official **totals** are raw 24h-style
+  counts from live APIs. **Signal intensity 0–100** is a **composite index** (not the same as any one total).
+- **AI-validated signals (24h)** are rows in `data/signals.db` that passed the validator; this is often **lower**
+  than raw feed volume.
+- **Cache:** the outbreak bundle is cached **{OUTBREAK_SNAPSHOT_TTL_SEC // 60} minutes** (or use **Refresh** for a
+  new pull). A wrong “~30s” label was a bug; TTL is not 30 seconds.
+- **Local :8501 vs another process or Cloud** = different machine, time, API keys, and database — expect different counts.
+            """.strip()
+        )
     if st.session_state["feed_health"]["outbreak"]["status"] == "degraded":
         st.warning("Outbreak feed is in degraded mode. Showing baseline signals while enrichment feed is unavailable.")
     live_col1, live_col2, live_col3 = st.columns([1.4, 1.2, 1])
@@ -1125,7 +1171,8 @@ elif nav == "Strategic signals":
         st.markdown("`Live mode`: Cached feeds are refreshed continuously by TTL and manual trigger.")
     with live_col2:
         st.markdown(
-            f"`Freshness`: Outbreak bundle ~30s cache + manual refresh | Pulled at {st.session_state['last_manual_refresh'].strftime('%H:%M:%S')}"
+            f"`Freshness`: Outbreak bundle ~{OUTBREAK_SNAPSHOT_TTL_SEC // 60} min cache + manual refresh | "
+            f"Last manual: {st.session_state['last_manual_refresh'].strftime('%H:%M:%S')}"
         )
     with live_col3:
         if st.button("Refresh Dashboard Feed", key="dash_refresh_btn"):
@@ -1178,6 +1225,26 @@ elif nav == "Strategic signals":
             st.metric(card[0], card[1], card[2])
             if st.button(detail_btn, key=f"sig_detail_btn_{detail_key}", use_container_width=True):
                 st.session_state["strategic_signal_detail"] = detail_key
+
+    sx1, sx2, sx3 = st.columns(3)
+    with sx1:
+        st.metric(
+            "Composite signal index (0–100)",
+            f"{dashboard['signal_score']}",
+            help="Weighted blend of GDELT, open-web, official volume, and feed connectivity — not a single raw count.",
+        )
+    with sx2:
+        st.metric(
+            "AI-validated signals (24h)",
+            f"{int(dashboard.get('validated_signals_24h', 0) or 0):,}",
+            help="Rows in the local signal store that passed the validator; usually lower than raw feed volume.",
+        )
+    with sx3:
+        st.metric(
+            "Combined raw volume (24h, est.)",
+            f"{int(dashboard.get('combined_total', 0) or 0):,}",
+            help="Sum of open-web + official 24h-style channel counts in this snapshot.",
+        )
 
     selected_detail = st.session_state.get("strategic_signal_detail", "gdelt_news")
     if selected_detail:

@@ -1,9 +1,11 @@
 """Check .env API key is set and accepted (no secrets printed)."""
+import os
 from pathlib import Path
 
-from dotenv import load_dotenv
-import os
 import requests
+from dotenv import load_dotenv
+
+from ai_config import openai_compatible_env_credentials
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -19,18 +21,13 @@ def mask(s: str) -> str:
 
 def main() -> None:
     keys = [
-        ("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY")),
         ("CURSOR_API_KEY", os.getenv("CURSOR_API_KEY")),
         ("AI_API_KEY", os.getenv("AI_API_KEY")),
+        ("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY")),
         ("XAI_API_KEY", os.getenv("XAI_API_KEY")),
     ]
-    base = (
-        os.getenv("OPENAI_BASE_URL")
-        or os.getenv("AI_BASE_URL")
-        or os.getenv("CURSOR_API_BASE_URL")
-        or "https://api.openai.com/v1"
-    ).rstrip("/")
-    model = os.getenv("AI_MODEL") or os.getenv("CURSOR_AI_MODEL") or "gpt-4o-mini"
+    api_key_resolved, base, model = openai_compatible_env_credentials()
+    base = (base or "").rstrip("/")
 
     print("--- Environment (masked) ---")
     for name, val in keys:
@@ -39,24 +36,28 @@ def main() -> None:
         else:
             print(f"{name}: NOT SET")
 
-    print("Base URL:", base)
-    print("Model:", model)
+    print("Base URL (as app resolves):", base)
+    print("Model (as app resolves; default depends on host if AI_MODEL unset):", model)
 
-    raw = None
     used = None
     for name, val in keys:
-        if val and val.strip():
-            raw = val.strip()
+        if val and val.strip() and val.strip() == (api_key_resolved or ""):
             used = name
             break
+    if not used and api_key_resolved:
+        used = "resolved (matches app key selection order)"
 
-    if not raw:
+    if not api_key_resolved:
         print()
         print("RESULT: No API key found. Add OPENAI_API_KEY (or similar) to .env")
         raise SystemExit(1)
 
     url = f"{base}/models"
-    r = requests.get(url, headers={"Authorization": f"Bearer {raw}"}, timeout=15)
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key_resolved}"},
+        timeout=15,
+    )
     print()
     print("--- API check GET /models ---")
     print("Using key from:", used)

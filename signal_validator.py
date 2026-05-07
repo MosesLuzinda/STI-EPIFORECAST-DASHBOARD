@@ -37,6 +37,9 @@ Configuration (env vars, all optional):
     CURSOR_API_KEY / AI_API_KEY / OPENAI_API_KEY / XAI_API_KEY
     CURSOR_API_BASE_URL / AI_BASE_URL / OPENAI_BASE_URL
     CURSOR_AI_MODEL / AI_MODEL
+    AI_FAILOVER_API_KEY / GROQ_API_KEY  (optional Groq failover)
+    AI_FAILOVER_BASE_URL / GROQ_BASE_URL (optional; default Groq OpenAI-compatible host)
+    AI_FAILOVER_MODEL / GROQ_MODEL       (optional; defaults per host)
 """
 from __future__ import annotations
 
@@ -48,6 +51,8 @@ import time
 from typing import Iterable
 
 import requests
+
+from ai_config import llm_openai_compatible_chain
 
 
 # Outbreak / disease vocabulary used as the cheap pre-filter. Kept in sync
@@ -76,36 +81,29 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = str(os.getenv(name, str(int(default)))).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 _DEFAULT_BUDGET = _env_int("SIGNAL_VALIDATOR_MAX_LLM_CALLS", 30)
 _CACHE_TTL_SEC = _env_int("SIGNAL_VALIDATOR_CACHE_TTL_SEC", 86_400)
 # Default kept under the data_services as_completed(timeout=15) deadline so
 # one batch call per items-fetcher stays within the live feed refresh window.
 _LLM_TIMEOUT_SEC = _env_float("SIGNAL_VALIDATOR_LLM_TIMEOUT", 11.0)
 _BATCH_SIZE = max(1, _env_int("SIGNAL_VALIDATOR_BATCH_SIZE", 10))
+_MAX_PENDING_ITEMS = max(1, _env_int("SIGNAL_VALIDATOR_MAX_PENDING_ITEMS", 120))
+_DISABLE_LLM = _env_bool("SIGNAL_VALIDATOR_DISABLE_LLM", False)
 _BUDGET_WINDOW_SEC = 60.0
+_MIN_ACCEPT_CONFIDENCE = max(0.0, min(1.0, _env_float("SIGNAL_VALIDATOR_MIN_ACCEPT_CONFIDENCE", 0.35)))
+_MAX_CACHE_ENTRIES = max(200, _env_int("SIGNAL_VALIDATOR_MAX_CACHE_ENTRIES", 5000))
+_HTTP_SESSION = requests.Session()
 
 
 _cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
 _budget_lock = threading.Lock()
 _budget_state: dict[str, float] = {"calls": 0.0, "window_start": time.time()}
-
-
-def _ai_creds() -> tuple[str | None, str, str]:
-    api_key = (
-        os.getenv("CURSOR_API_KEY")
-        or os.getenv("AI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("XAI_API_KEY")
-    )
-    base_url = (
-        os.getenv("CURSOR_API_BASE_URL")
-        or os.getenv("AI_BASE_URL")
-        or os.getenv("OPENAI_BASE_URL")
-        or "https://api.openai.com/v1"
-    ).rstrip("/")
-    model = os.getenv("CURSOR_AI_MODEL") or os.getenv("AI_MODEL") or "gpt-4o-mini"
-    return api_key, base_url, model
 
 
 def _hash_key(item: dict) -> str:
@@ -146,6 +144,11 @@ def _cache_get(key: str) -> dict | None:
 
 def _cache_set(key: str, value: dict) -> None:
     with _cache_lock:
+        if len(_cache) >= _MAX_CACHE_ENTRIES:
+            # Drop oldest entries to cap memory growth in long-lived processes.
+            overflow = len(_cache) - _MAX_CACHE_ENTRIES + 1
+            for k in list(_cache.keys())[:overflow]:
+                _cache.pop(k, None)
         _cache[key] = (time.time(), dict(value))
 
 
@@ -189,10 +192,6 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _llm_classify_batch(items: list[dict]) -> list[dict | None] | None:
-    api_key, base_url, model = _ai_creds()
-    if not api_key:
-        return None
-
     payload_items = [
         {
             "i": idx,
@@ -205,56 +204,77 @@ def _llm_classify_batch(items: list[dict]) -> list[dict | None] | None:
         for idx, it in enumerate(items)
     ]
     user_prompt = "Items:\n" + json.dumps(payload_items, ensure_ascii=False)
+    json_body = {
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+    }
 
+    for api_key, base_url, model in llm_openai_compatible_chain():
+        body = dict(json_body)
+        body["model"] = model
+        try:
+            response = _HTTP_SESSION.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=_LLM_TIMEOUT_SEC,
+            )
+            if response.status_code != 200:
+                continue
+            text = response.json()["choices"][0]["message"]["content"]
+            data = json.loads(_strip_code_fence(text))
+        except Exception:
+            continue
+
+        if not isinstance(data, list):
+            continue
+
+        out: list[dict | None] = [None] * len(items)
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                idx = int(entry.get("i"))
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= len(items):
+                continue
+            try:
+                confidence = float(entry.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            out[idx] = {
+                "is_signal": bool(entry.get("is_signal")),
+                "confidence": max(0.0, min(1.0, confidence)),
+                "disease": str(entry.get("disease") or "").strip()[:60],
+                "location": str(entry.get("location") or "").strip()[:120],
+                "reason": str(entry.get("reason") or "").strip()[:240],
+                "engine": "llm",
+            }
+        return out
+
+    return None
+
+
+def _apply_acceptance_policy(decision: dict) -> dict:
+    """Normalize low-confidence positives to reduce noisy false alerts."""
+    out = dict(decision or {})
+    is_signal = bool(out.get("is_signal"))
     try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.1,
-            },
-            timeout=_LLM_TIMEOUT_SEC,
-        )
-        if response.status_code != 200:
-            return None
-        text = response.json()["choices"][0]["message"]["content"]
-        data = json.loads(_strip_code_fence(text))
-    except Exception:
-        return None
-
-    if not isinstance(data, list):
-        return None
-
-    out: list[dict | None] = [None] * len(items)
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            idx = int(entry.get("i"))
-        except (TypeError, ValueError):
-            continue
-        if idx < 0 or idx >= len(items):
-            continue
-        try:
-            confidence = float(entry.get("confidence") or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        out[idx] = {
-            "is_signal": bool(entry.get("is_signal")),
-            "confidence": max(0.0, min(1.0, confidence)),
-            "disease": str(entry.get("disease") or "").strip()[:60],
-            "location": str(entry.get("location") or "").strip()[:120],
-            "reason": str(entry.get("reason") or "").strip()[:240],
-            "engine": "llm",
-        }
+        confidence = float(out.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    out["confidence"] = confidence
+    if is_signal and confidence < _MIN_ACCEPT_CONFIDENCE:
+        out["is_signal"] = False
+        out["reason"] = f"below confidence threshold ({_MIN_ACCEPT_CONFIDENCE:.2f})"
     return out
 
 
@@ -274,6 +294,7 @@ def validate_signals_batch(items: Iterable[dict]) -> list[dict]:
         for _ in items_list
     ]
     pending_indices: list[int] = []
+    pending_by_hash: dict[str, list[int]] = {}
 
     for idx, item in enumerate(items_list):
         key = _hash_key(item)
@@ -299,9 +320,27 @@ def validate_signals_batch(items: Iterable[dict]) -> list[dict]:
         }
         if kw_hit:
             pending_indices.append(idx)
+            pending_by_hash.setdefault(key, []).append(idx)
 
-    for batch_start in range(0, len(pending_indices), _BATCH_SIZE):
-        chunk = pending_indices[batch_start:batch_start + _BATCH_SIZE]
+    if _DISABLE_LLM:
+        for idx, item in enumerate(items_list):
+            _cache_set(_hash_key(item), decisions[idx])
+        return decisions
+
+    # Deduplicate within a batch (same url/title often appears across feeds),
+    # then cap work to protect response time/cost.
+    unique_pending: list[int] = []
+    seen_pending_hashes: set[str] = set()
+    for idx in pending_indices:
+        h = _hash_key(items_list[idx])
+        if h in seen_pending_hashes:
+            continue
+        seen_pending_hashes.add(h)
+        unique_pending.append(idx)
+    trimmed_pending = unique_pending[:_MAX_PENDING_ITEMS]
+
+    for batch_start in range(0, len(trimmed_pending), _BATCH_SIZE):
+        chunk = trimmed_pending[batch_start:batch_start + _BATCH_SIZE]
         if not chunk:
             break
         if not _budget_take():
@@ -313,9 +352,15 @@ def validate_signals_batch(items: Iterable[dict]) -> list[dict]:
         for offset, result in enumerate(results):
             if result is None:
                 continue
-            decisions[chunk[offset]] = result
+            normalized = _apply_acceptance_policy(result)
+            primary_idx = chunk[offset]
+            decisions[primary_idx] = normalized
+            # Mirror result to duplicate items in the same batch.
+            for dup_idx in pending_by_hash.get(_hash_key(items_list[primary_idx]), []):
+                decisions[dup_idx] = dict(normalized)
 
     for idx, item in enumerate(items_list):
+        decisions[idx] = _apply_acceptance_policy(decisions[idx])
         _cache_set(_hash_key(item), decisions[idx])
 
     return decisions

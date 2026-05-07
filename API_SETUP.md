@@ -1,4 +1,4 @@
-# STI-EPI-FORECAST API Setup
+# Pathogen Economy Epiforecast API Setup
 
 This creates your own AI API backend (Cursor-style), which your dashboard and mobile app can call.
 

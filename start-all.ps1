@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-Write-Host "Starting STI-EPI-FORECAST services..." -ForegroundColor Green
+Write-Host "Starting Pathogen Economy Epiforecast services..." -ForegroundColor Green
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPython = Join-Path $projectRoot "venv\Scripts\python.exe"

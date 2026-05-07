@@ -377,7 +377,7 @@ def render_east_africa_regional(realtime_data: dict):
 def render_717_impact():
     host, condition, disease = _pe_context()
     st.title("7-1-7 early action benefits")
-    st.caption("**7** days to detect, **1** day to notify, **7** days to mount public health response — estimate lives and costs saved if STI-EpiForecast enables this cadence.")
+    st.caption("**7** days to detect, **1** day to notify, **7** days to mount public health response — estimate lives and costs saved if Pathogen Economy Epiforecast enables this cadence.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -543,7 +543,7 @@ def render_reports_library(realtime_data: dict):
         else:
             top_alerts = []
 
-        buf.write("STI-EpiForecast App — Executive Summary\n")
+            buf.write("Pathogen Economy Epiforecast — Executive Summary\n")
         buf.write("=" * 52 + "\n")
         buf.write(f"Generated (UTC): {generated_utc}\n")
         buf.write(f"Feed snapshot time: {last_updated}\n")
@@ -600,7 +600,7 @@ def render_reports_library(realtime_data: dict):
         st.download_button(
             "Download latest generated summary (.txt)",
             st.session_state["pe_summary_txt"],
-            file_name=f"STI_EpiForecast_summary_{disease.replace(' ', '_')}.txt",
+            file_name=f"Pathogen_Economy_Epiforecast_summary_{disease.replace(' ', '_')}.txt",
             mime="text/plain",
             key="dl_gen_summary_txt",
         )
@@ -668,7 +668,7 @@ def render_reports_library(realtime_data: dict):
         if st.button("Generate social + health signal report (.txt)", key="gen_social_health_txt"):
             buf = io.StringIO()
             generated_utc = f"{datetime.utcnow().isoformat()}Z"
-            buf.write("STI-EpiForecast - Social and Health-Site Signals Report\n")
+            buf.write("Pathogen Economy Epiforecast - Social and Health-Site Signals Report\n")
             buf.write("=" * 62 + "\n")
             buf.write(f"Generated (UTC): {generated_utc}\n")
             buf.write(f"Snapshot time: {realtime_data.get('last_updated', 'n/a')}\n")
@@ -698,7 +698,7 @@ def render_reports_library(realtime_data: dict):
             st.download_button(
                 "Download social + health signal report (.txt)",
                 st.session_state["social_health_report_txt"],
-                file_name=f"STI_EpiForecast_social_health_signals_{disease.replace(' ', '_')}.txt",
+                file_name=f"Pathogen_Economy_Epiforecast_social_health_signals_{disease.replace(' ', '_')}.txt",
                 mime="text/plain",
                 key="dl_social_health_txt",
             )

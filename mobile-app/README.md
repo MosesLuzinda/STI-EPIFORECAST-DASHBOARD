@@ -1,4 +1,4 @@
-# STI-EPI-FORECAST Mobile (Expo Go)
+# Pathogen Economy Epiforecast Mobile (Expo Go)
 
 ## Run locally
 
