@@ -21,7 +21,7 @@ Notes:
 From project root:
 
 ```bash
-python -m uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn backend.api_server:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Open docs:

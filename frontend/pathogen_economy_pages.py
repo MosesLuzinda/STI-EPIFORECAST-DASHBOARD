@@ -7,21 +7,28 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from data_services import (
+from backend.data_services import (
     analyze_outbreak_risk,
     compute_dashboard_metrics,
     generate_pe_countermeasures_rows,
     generate_venture_matrix_ai,
 )
+from backend.uganda_geospatial_data import default_hotspot_district_bases
+from backend.uganda_folium_maps import build_uganda_operational_map, streamlit_folium_available
 
-THINKTANK_DIR = Path("assets") / "pe_thinktank"
+THINKTANK_DIR = _ROOT / "assets" / "pe_thinktank"
 THINKTANK_MEMBERS_JSON = THINKTANK_DIR / "members.json"
 
 
@@ -176,28 +183,22 @@ def _pe_context() -> tuple[str, str, str]:
 def render_pathogen_workspace_home(realtime_data: dict):
     host, condition, disease = _pe_context()
     risk = analyze_outbreak_risk(realtime_data)
-    st.title("Pathogen workspace")
-    st.caption(
-        "Select **Host realm**, **Condition class**, and **Disease / condition** in the sidebar. "
-        "All VDTEC, trial, regional, and 7-1-7 modules use this focus."
-    )
+    st.title("Pathogen planning")
+    st.caption("These tiles follow your **sidebar** choices (who is affected, situation type, disease).")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Host realm", host)
+        st.metric("Affected group", host)
     with c2:
-        st.metric("Condition class", condition)
+        st.metric("Situation type", condition)
     with c3:
-        st.metric("Focus", disease)
+        st.metric("Focus disease", disease)
     with c4:
         st.metric("Composite risk (sim.)", f"{risk['risk_score']}/100", risk["risk_level"])
 
-    st.markdown(
-        f"""
-        **Strategic read:** Pathogen Economy translates signals into **VDTEC** (vaccines, drugs, diagnostics,
-        consumables) and **medical devices** — what to develop, import, or export; first **100-day** surge volumes;
-        and **return on public investment** for Government of Uganda. Current open-web urgency:
-        **{realtime_data.get('social_urgency_score', 0)}/100** ({realtime_data.get('sim_recommended_tier', 'Routine')} posture).
-        """
+    st.info(
+        f"**Snapshot:** urgency about **{realtime_data.get('social_urgency_score', 0)}/100** "
+        f"— suggested stance: **{realtime_data.get('sim_recommended_tier', 'Routine')}**. "
+        "Use the top menu for trials, supplies, and regional views."
     )
 
 
@@ -205,10 +206,6 @@ def render_vdtec_roi(realtime_data: dict):
     host, condition, disease = _pe_context()
     risk = analyze_outbreak_risk(realtime_data)
     st.title("VDTEC & Pathogen ROI")
-    st.caption(
-        "Countermeasure rows: AI-enriched when API keys are configured; otherwise rule-based catalogue. "
-        "**Red** = no licensed vaccine / critical product gap — Pathogen Economy **priority**."
-    )
 
     c_ai, c_rst = st.columns(2)
     with c_ai:
@@ -258,11 +255,7 @@ def render_vdtec_roi(realtime_data: dict):
             styles = ["background-color: #451a03; color: #fed7aa"] * len(row)
         return styles
 
-    st.dataframe(show.style.apply(_style_rows, axis=1), use_container_width=True, height=420)
-    st.caption(
-        "Quantities are **proxy** scalers from national programme envelopes — replace with National Medical Stores "
-        "SKU forecasts and outbreak scenarios."
-    )
+    st.dataframe(show.style.apply(_style_rows, axis=1), height=420)
 
     st.subheader("Harvest for Government of Uganda (illustrative bands)")
     tot_low = float(df["_gou_return_low"].sum() * surge)
@@ -280,23 +273,10 @@ def render_vdtec_roi(realtime_data: dict):
 def render_clinical_trial_sites():
     host, condition, disease = _pe_context()
     st.title("Clinical trial sites (Uganda)")
-    st.caption("Rank districts by **spatial risk** proxy for this disease — suggest sites where transmission intensity meets operational feasibility.")
 
-    districts = [
-        ("Kampala", 0.72),
-        ("Wakiso", 0.64),
-        ("Gulu", 0.58),
-        ("Arua", 0.61),
-        ("Mbale", 0.49),
-        ("Kasese", 0.68),
-        ("Mbarara", 0.45),
-        ("Lira", 0.53),
-        ("Hoima", 0.56),
-        ("Fort Portal", 0.51),
-    ]
     host_w = {"Human": 1.0, "Animal": 0.92, "Plant": 0.55}[host]
     records = []
-    for district, base in districts:
+    for district, base in default_hotspot_district_bases():
         r = min(0.98, base * host_w)
         records.append(
             {
@@ -307,15 +287,33 @@ def render_clinical_trial_sites():
             }
         )
     df = pd.DataFrame(records).sort_values("Spatial risk score", ascending=False)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df)
     top = ", ".join(df.head(3)["District"].tolist())
     st.success(f"Suggested priority districts for **{disease}** ({host}): **{top}**.")
+
+    st.subheader("Prioritization map + clinical anchors")
+    df_map = df.assign(RiskScore=df["Spatial risk score"], RiskLabel=df["Trial fit"])
+    if streamlit_folium_available():
+        from streamlit_folium import st_folium
+
+        m = build_uganda_operational_map(
+            df_map,
+            focus_disease=disease,
+            subtitle=f"Pathogen workspace — {host} / {condition}",
+            show_heatmap=True,
+            show_clinical_layer=True,
+        )
+        if m is not None:
+            st_folium(m, use_container_width=True, height=540, key="clinical_trial_sites_map")
+        else:
+            st.warning("Could not build map.")
+    else:
+        st.info("Install **folium** and **streamlit-folium** for the interactive map.")
 
 
 def render_nms_100_day_surge():
     host, condition, disease = _pe_context()
     st.title("NMS 100-day surge quantities")
-    st.caption("SKU-level planning view — links sidebar focus to illustrative surge multipliers (replace with NMS master data).")
 
     base_items = [
         ("ORS sachets", "course", 2_800_000),
@@ -338,12 +336,11 @@ def render_nms_100_day_surge():
     for name, u, q0 in base_items:
         q = int(q0 * mult * (1.1 if disease in ("Cholera", "Ebola", "Marburg") else 1.0))
         rows.append({"SKU": name, "Unit": u, "Qty first 100 days (est.)": q, "Notes": f"Scaled for {disease} / {host}"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows))
 
 
 def render_east_africa_regional(realtime_data: dict):
     st.title("East Africa regional market")
-    st.caption("Populations (approx.) and **burden / export opportunity** when neighbours signal outbreaks (e.g. DRC).")
 
     rows = [
         ("Uganda", "UGA", 48.8, 0.72, "Primary manufacturing & NMS anchor"),
@@ -367,8 +364,8 @@ def render_east_africa_regional(realtime_data: dict):
         color_continuous_scale="YlOrRd",
     )
     fig.update_layout(template="plotly_dark")
-    st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(df, use_container_width=True)
+    st.plotly_chart(fig)
+    st.dataframe(df)
     st.info(
         f"Live signal density (24h mentions): **{int(realtime_data.get('news_mentions', 0)):,}** — use as a **weak** proxy for regional media attention until EAC line lists are wired."
     )
@@ -377,7 +374,6 @@ def render_east_africa_regional(realtime_data: dict):
 def render_717_impact():
     host, condition, disease = _pe_context()
     st.title("7-1-7 early action benefits")
-    st.caption("**7** days to detect, **1** day to notify, **7** days to mount public health response — estimate lives and costs saved if Pathogen Economy Epiforecast enables this cadence.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -409,33 +405,27 @@ def render_717_impact():
     with m3:
         st.metric("Treatment + control costs saved (USD M)", f"${costs_saved / 1e6:,.2f}")
 
-    st.caption(
-        f"Focus: **{disease}** ({host}, {condition}). Replace coefficients with calibrated health economics from MoH / WHO AFRO."
-    )
 
 
 def render_sti_venture_matrix():
     st.title("STI venture success matrix")
-    st.caption("Weighted scorecard for **fund vs do not fund** — variables can be refined with Pathogen Economy leadership.")
 
     refresh = st.button("Regenerate variable weights (AI assist)", key="venture_ai_btn")
     if refresh or "venture_df" not in st.session_state:
         st.session_state["venture_df"] = generate_venture_matrix_ai(refresh=refresh)
 
     df = st.session_state["venture_df"]
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df)
 
     weights = df.set_index("Variable")["Weight (0–1)"].astype(float)
     scores = df.set_index("Variable")["Project score (0–100)"].astype(float)
     total = float((weights * scores).sum() / weights.sum())
     threshold = st.slider("Fund if score ≥", 50, 90, 68)
     st.metric("Composite venture score", f"{total:.1f} / 100", "FUND" if total >= threshold else "DO NOT FUND (review)")
-    st.caption("AI extends the rubric when keys are present; defaults are structured placeholders.")
 
 
 def render_epi_thinktank():
     st.title("EPI-ThinkTank and Leadership")
-    st.caption("Leadership and technical teams aligned to Pathogen Economy delivery.")
 
     members = load_thinktank_members()
     cols = st.columns(3)
@@ -444,7 +434,7 @@ def render_epi_thinktank():
         p = THINKTANK_DIR / photo_name if photo_name else None
         with cols[i % 3]:
             if p is not None and p.is_file():
-                st.image(str(p), use_container_width=True)
+                st.image(str(p), width="stretch")
             else:
                 st.markdown(
                     "<div style='width:100%;height:220px;border-radius:12px;background:#e5e7eb;display:flex;"
@@ -460,7 +450,6 @@ def render_epi_thinktank():
 
 def render_developers():
     st.title("Developers and Delivery Team")
-    st.caption("Organized by role and delivery responsibility.")
     team = [
         {
             "name": "Abel STI",
@@ -483,7 +472,7 @@ def render_developers():
             photo_name = (member.get("photo") or "").strip()
             image_path = THINKTANK_DIR / photo_name if photo_name else None
             if image_path is not None and image_path.is_file():
-                st.image(str(image_path), use_container_width=True)
+                st.image(str(image_path), width="stretch")
             else:
                 st.markdown(
                     "<div style='width:100%;height:190px;border-radius:12px;background:#e5e7eb;display:flex;"
@@ -503,12 +492,11 @@ def render_developers():
             )
 
 
-REPORTS_DIR = Path("uploads") / "reports"
+REPORTS_DIR = _ROOT / "uploads" / "reports"
 
 
 def render_reports_library(realtime_data: dict):
     st.title("Reports library")
-    st.caption("Download **summary** briefs only. Raw datasets stay in secured pipelines — not distributed from this shelf.")
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -606,10 +594,6 @@ def render_reports_library(realtime_data: dict):
         )
 
     st.markdown("### Social + official health-site signal report")
-    st.caption(
-        "Build a focused signal report from social/open-web channels plus official health-site domains "
-        "(WHO, CDC, UN Global Health pages detected through GDELT domain monitoring)."
-    )
     social_channels = realtime_data.get("social_channels") or {}
     health_channels = realtime_data.get("health_site_signals") or {}
     report_rows = []
@@ -646,7 +630,7 @@ def render_reports_library(realtime_data: dict):
             },
         )
         fig_mix.update_layout(showlegend=False)
-        st.plotly_chart(fig_mix, use_container_width=True)
+        st.plotly_chart(fig_mix)
 
         top_channels = df_signals.sort_values("Signals_24h", ascending=False).head(8)
         fig_top = px.bar(
@@ -662,9 +646,9 @@ def render_reports_library(realtime_data: dict):
             },
         )
         fig_top.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_top, use_container_width=True)
+        st.plotly_chart(fig_top)
 
-        st.dataframe(df_signals, use_container_width=True, hide_index=True)
+        st.dataframe(df_signals, hide_index=True)
         if st.button("Generate social + health signal report (.txt)", key="gen_social_health_txt"):
             buf = io.StringIO()
             generated_utc = f"{datetime.utcnow().isoformat()}Z"
@@ -714,7 +698,6 @@ def render_reports_library(realtime_data: dict):
     if not files:
         st.info("No uploaded reports yet. Admins can upload PDF/DOCX summaries under **Admin → Report uploads**.")
     else:
-        st.caption("Most recent report files:")
         for idx, f in enumerate(files[:40]):
             if f.is_file():
                 data = f.read_bytes()

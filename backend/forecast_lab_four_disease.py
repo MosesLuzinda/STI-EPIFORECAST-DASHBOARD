@@ -11,21 +11,15 @@ from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
-from ai_config import chat_text_from_prompts, openai_compatible_env_credentials
-
-FOUR_DISEASES = ("Cholera", "Malaria", "Typhoid", "Marburg")
-FACTOR_KEYS = (
-    "environmental",
-    "climatic",
-    "behavioral",
-    "sanitation",
-    "vector",
-    "water",
-    "mobility",
-    "border",
-    "health_system",
+from .ai_config import chat_text_from_prompts, openai_compatible_env_credentials
+from .json_extract import strip_markdown_fence
+from .statistical_forecast import (
+    DEFAULT_FACTOR_IMPUTE,
+    FACTOR_KEYS,
+    FOUR_DISEASES,
+    four_disease_brief_from_metrics,
+    no_ai_mode,
 )
-DEFAULT_FACTOR_IMPUTE = 20
 _V1_CHAT_TIMEOUT_SEC = 120.0
 _RADAR_COLORS = ("#3b82f6", "#22c55e", "#f59e0b", "#f43f5e")
 
@@ -53,15 +47,7 @@ def _chat_completions(
     return True, str(text), None
 
 
-def _strip_code_fence(text: str) -> str:
-    t = (text or "").strip()
-    if t.startswith("```"):
-        parts = t.split("```", 2)
-        if len(parts) >= 2:
-            t = parts[1]
-        if t.lower().startswith("json"):
-            t = t[4:]
-    return t.strip()
+_strip_code_fence = strip_markdown_fence  # backwards-compat alias for any local refs.
 
 
 def _compact_realtime_context(realtime_data: dict) -> str:
@@ -163,6 +149,11 @@ def generate_four_disease_brief_json(realtime_data: dict) -> dict[str, Any]:
     """
     Call the chat model; return { "ok": bool, "brief"?: dict, "error"?: str, "raw_excerpt"?: str }.
     """
+    if no_ai_mode():
+        brief = four_disease_brief_from_metrics(realtime_data or {})
+        _ensure_factor_matrix(brief)
+        return {"ok": True, "brief": brief, "raw_excerpt": ""}
+
     api_key, base_url, model = openai_compatible_env_credentials()
     if not api_key:
         return {

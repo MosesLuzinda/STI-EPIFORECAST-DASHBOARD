@@ -190,8 +190,8 @@ def main() -> None:
             "P1 — AI primary (OpenAI)",
             "Configured through `AI_API_KEY`, `AI_BASE_URL`, and `AI_MODEL` (or `OPENAI_*` aliases). "
             "OpenAI drives: (a) batched disease-signal validation in `signal_validator.py`, (b) Forecast Lab "
-            "JSON briefs in `forecast_lab_four_disease.py`, (c) optional NLP alert copy in `data_services.py`, "
-            "and (d) OpenAI-compatible proxy routes in `api_server.py` (`/v1/chat/completions`, `/v1/nlp-alerts`, "
+        "JSON briefs in `backend/forecast_lab_four_disease.py`, (c) optional NLP alert copy in `backend/data_services.py`, "
+        "and (d) OpenAI-compatible proxy routes in `backend/api_server.py` (`/v1/chat/completions`, `/v1/nlp-alerts`, "
             "`/v1/cursor/chat`).",
         ),
         (
@@ -210,7 +210,7 @@ def main() -> None:
         (
             "P1 — Uptime + paging (Better Stack)",
             "Better Stack performs external synthetic checks and on-call notifications. Target the public `/health` "
-            "endpoint on `api_server.py` (returns `pathogen-economy-epiforecast-api` metadata) plus the public "
+            "endpoint on `backend/api_server.py` (returns `pathogen-economy-epiforecast-api` metadata) plus the public "
             "Streamlit URL once exposed. Optional `BETTER_STACK_HEARTBEAT_URL` can be set for cron-style heartbeats "
             "from backup jobs.",
         ),
@@ -242,12 +242,13 @@ def main() -> None:
 
     _add_heading(doc, "4. Component map (repository)", level=1)
     doc.add_paragraph(
-        "• app.py / app_pages.py / pathogen_economy_pages.py — Streamlit UX, navigation, admin controls.\n"
-        "• api_server.py — FastAPI NLP alerts, SEIR endpoint, OpenAI-compatible proxy, `/health` for monitors.\n"
-        "• data_services.py — Data ingestion, SMTP alerts, epidemiology helpers.\n"
-        "• ai_config.py — Provider resolution + automatic Groq failover for chat-style calls.\n"
-        "• signal_validator.py — LLM batches with failover for outbreak signal adjudication.\n"
-        "• signal_store.py — SQLite persistence for validated signals.\n"
+        "• frontend/app.py, app_pages.py, pathogen_economy_pages.py — Streamlit UX, navigation, admin controls.\n"
+        "• backend/api_server.py — FastAPI NLP alerts, SEIR endpoint, OpenAI-compatible proxy, `/health` for monitors.\n"
+        "• backend/data_services.py — Data ingestion, SMTP alerts, epidemiology helpers.\n"
+        "• backend/ai_config.py — Provider resolution + automatic Groq failover for chat-style calls.\n"
+        "• backend/signal_validator.py — LLM batches with failover for outbreak signal adjudication.\n"
+        "• backend/signal_store.py — SQLite persistence for validated signals.\n"
+        "• data/README.md — where runtime datasets (e.g. `signals.db`) live.\n"
         "• mobile-app/ — Expo client aligned to the same API patterns.\n"
         "• .env.example — authoritative list of integration environment variables."
     )

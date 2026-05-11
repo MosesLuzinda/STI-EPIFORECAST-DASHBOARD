@@ -14,25 +14,42 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from ai_config import chat_text_from_prompts, openai_compatible_env_credentials
-from signal_validator import validate_signals_batch, keyword_relevant
-from signal_store import (
+from .ai_config import chat_text_from_prompts, openai_compatible_env_credentials
+from .project_paths import PROJECT_ROOT
+from .signal_validator import validate_signals_batch, keyword_relevant
+from .statistical_forecast import (
+    OUTBREAK_KEYWORDS as _OUTBREAK_KEYWORDS,
+    PRIORITY_DISEASE_LOWER as _PRIORITY_DISEASE_LOWER,
+    four_disease_brief_from_metrics,
+    is_priority_disease_name as is_priority_disease,
+    no_ai_mode,
+    nlp_alerts_statistical,
+    offline_snapshot_headers,
+    offline_snapshot_mode,
+)
+from .signal_store import (
     append_signals as _persist_signals,
     count_recent as _count_recent_signals,
     daily_aggregate as _signal_daily_aggregate,
+    disease_counts_recent as _disease_counts_recent,
     list_diseases as _list_signal_diseases,
 )
 
 # Must match @st.cache_data(ttl=…) on fetch_realtime_outbreak_data.
 OUTBREAK_SNAPSHOT_TTL_SEC = 300
+
+
 DEFAULT_HTTP_TIMEOUT_SEC = 12
 _HTTP_SESSION = requests.Session()
 _HTTP_SESSION.headers.update({"User-Agent": "PathogenEconomyEpiforecast/1.0 (Pathogen Economy Epiforecast; +https://github.com)"})
 
-ADMIN_ALERTS_FILE = Path("admin_alerts_config.json")
+ADMIN_ALERTS_FILE = PROJECT_ROOT / "admin_alerts_config.json"
+
+# OSINT-first ingestion: GDELT, Reddit public JSON, HN Algolia, OWID CSVs need no tokens.
+# NEWSAPI_* and enterprise social tokens are optional; add MOH/WHO RSS for zero-cost growth.
 
 
-def read_csv_with_retry(url: str, attempts: int = 3, timeout_sec: int = 20):
+def read_csv_with_retry(url: str, attempts: int = 2, timeout_sec: int = 12):
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
@@ -86,7 +103,7 @@ def _http_get(
     return _HTTP_SESSION.get(url, params=params, timeout=timeout_sec, headers=headers)
 
 
-def _fetch_gdelt_hits(timeout_sec: float = 20) -> tuple[int, bool]:
+def _fetch_gdelt_hits(timeout_sec: float = 12) -> tuple[int, bool]:
     """
     GDELT outbreak-article volume (last 24h) via the doc API.
     The legacy geo/geo endpoint returns 404 — we use doc/doc + ArtList and
@@ -255,7 +272,7 @@ def _fetch_newsapi_total(timeout_sec: float = 8) -> tuple[int, bool]:
         return 0, False
 
 
-def _fetch_gdelt_domain_hits(domain: str, timeout_sec: float = 15) -> tuple[int, bool]:
+def _fetch_gdelt_domain_hits(domain: str, timeout_sec: float = 8) -> tuple[int, bool]:
     """Count last-day disease articles for a specific domain via GDELT."""
     try:
         url = (
@@ -272,17 +289,9 @@ def _fetch_gdelt_domain_hits(domain: str, timeout_sec: float = 15) -> tuple[int,
         return 0, False
 
 
-# Outbreak / disease keyword filter used to keep RSS items relevant.
-_OUTBREAK_KEYWORDS = (
-    "outbreak", "epidemic", "pandemic", "cholera", "malaria", "ebola",
-    "marburg", "dengue", "influenza", "h5n1", "h7n9", "covid", "mpox",
-    "measles", "rabies", "yellow fever", "polio", "lassa", "anthrax",
-    "typhoid", "rift valley", "zika", "rsv", "tuberculosis", "hiv",
-    "diphtheria", "meningitis", "leptospirosis",
-)
-
-
 def _is_outbreak_relevant(text: str) -> bool:
+    # Outbreak vocabulary is the single tuple ``OUTBREAK_KEYWORDS`` in
+    # ``statistical_forecast`` (also used by ``signal_validator``).
     if not text:
         return False
     lower = text.lower()
@@ -335,7 +344,7 @@ def _validate_and_persist(candidates: list[dict]) -> list[dict]:
     return decisions
 
 
-def _fetch_who_outbreak_news_count(timeout_sec: float = 10) -> tuple[int, bool]:
+def _fetch_who_outbreak_news_count(timeout_sec: float = 7) -> tuple[int, bool]:
     """
     Outbreak-relevant items across WHO RSS feeds (current state, not just 24h).
     The legacy `feeds/entity/emergencies/...` URLs return 404 — we use the
@@ -368,7 +377,7 @@ def _fetch_rss_items(
     feed_url: str,
     source_label: str,
     limit: int = 8,
-    timeout_sec: float = 10,
+    timeout_sec: float = 7,
     outbreak_only: bool = True,
 ) -> tuple[list[dict], bool]:
     """
@@ -439,7 +448,7 @@ def _fetch_rss_items(
 
 def _fetch_rss_count(
     feed_url: str,
-    timeout_sec: float = 10,
+    timeout_sec: float = 7,
     outbreak_only: bool = True,
 ) -> tuple[int, bool]:
     """Lightweight RSS counter that only keeps outbreak-relevant items."""
@@ -462,17 +471,17 @@ def _fetch_rss_count(
         return 0, False
 
 
-def _fetch_cdc_outbreak_news_count(timeout_sec: float = 10) -> tuple[int, bool]:
+def _fetch_cdc_outbreak_news_count(timeout_sec: float = 7) -> tuple[int, bool]:
     """CDC outbreak news RSS entries (filtered to outbreak-relevant items)."""
     return _fetch_rss_count("https://tools.cdc.gov/api/v2/resources/media/403372.rss", timeout_sec=timeout_sec, outbreak_only=False)
 
 
-def _fetch_un_global_health_count(timeout_sec: float = 15) -> tuple[int, bool]:
+def _fetch_un_global_health_count(timeout_sec: float = 8) -> tuple[int, bool]:
     """UN global health page signal via GDELT domain query."""
     return _fetch_gdelt_domain_hits("un.org", timeout_sec=timeout_sec)
 
 
-def _fetch_gdelt_top_articles(max_records: int = 10, timeout_sec: float = 20) -> tuple[list[dict], bool]:
+def _fetch_gdelt_top_articles(max_records: int = 10, timeout_sec: float = 10) -> tuple[list[dict], bool]:
     """
     Pull recent outbreak-related article links from GDELT for quick drill-down,
     then run them through the AI signal validator. Only items confirmed as
@@ -587,7 +596,37 @@ def fetch_realtime_outbreak_data():
     - NewsAPI: optional when NEWSAPI_KEY is set.
     - WHO/CDC feeds + UN domain signal counts.
     This function intentionally avoids synthetic case magnitudes.
+
+    EPFORECAST_OFFLINE_SNAPSHOT=1 skips all feed HTTP; uses zeros plus local `signals.db` tallies.
     """
+    if offline_snapshot_mode():
+        data = offline_snapshot_headers()
+        try:
+            data["validated_signals_24h"] = int(_count_recent_signals(24))
+            data["validated_diseases"] = _list_signal_diseases(min_count=1)[:25]
+            rows_24h = _disease_counts_recent(24, min_count=1)
+            data["validated_disease_counts_24h"] = [{"disease": d, "count": n} for d, n in rows_24h]
+        except Exception:
+            data["validated_signals_24h"] = 0
+            data["validated_diseases"] = []
+            data["validated_disease_counts_24h"] = []
+        try:
+            from .coolio_auto_ingest import enrich_realtime_for_coolio_live
+
+            enrich_realtime_for_coolio_live(data)
+        except Exception:
+            data.setdefault("coolio_live", None)
+            data.setdefault("coolio_signal_nudge", 0.0)
+        try:
+            from .coolio_signal_lens import enrich_realtime_with_coolio_signal_lens
+
+            enrich_realtime_with_coolio_signal_lens(data)
+        except Exception:
+            data.setdefault("coolio_signal_lens", {})
+            data.setdefault("coolio_verified_events", [])
+        data["dashboard"] = compute_dashboard_metrics(data)
+        return data
+
     gdelt_hits, gdelt_ok = 0, False
     reddit_n, reddit_ok = 0, False
     hn_n, hn_ok = 0, False
@@ -617,7 +656,13 @@ def fetch_realtime_outbreak_data():
     RELIEFWEB_FEED = "https://reliefweb.int/disasters/rss.xml?primary_type=4611"
     PAHO_FEED = "https://www.paho.org/en/rss.xml"
 
-    pool = ThreadPoolExecutor(max_workers=14)
+    try:
+        _cold_deadline_sec = float(os.getenv("EPFORECAST_FEED_DEADLINE_SEC", "7") or "7")
+    except ValueError:
+        _cold_deadline_sec = 7.0
+    _cold_deadline_sec = max(3.0, min(20.0, _cold_deadline_sec))
+
+    pool = ThreadPoolExecutor(max_workers=18)
     try:
         futures = {
             pool.submit(_fetch_gdelt_hits, 12): "gdelt",
@@ -644,7 +689,7 @@ def fetch_realtime_outbreak_data():
             pool.submit(_fetch_meta_signal_count): "meta",
         }
         try:
-            for fut in as_completed(futures, timeout=15):
+            for fut in as_completed(futures, timeout=_cold_deadline_sec):
                 kind = futures[fut]
                 try:
                     val = fut.result()
@@ -874,9 +919,28 @@ def fetch_realtime_outbreak_data():
     try:
         data["validated_signals_24h"] = int(_count_recent_signals(24))
         data["validated_diseases"] = _list_signal_diseases(min_count=1)[:25]
+        rows_24h = _disease_counts_recent(24, min_count=1)
+        data["validated_disease_counts_24h"] = [{"disease": d, "count": n} for d, n in rows_24h]
     except Exception:
         data["validated_signals_24h"] = 0
         data["validated_diseases"] = []
+        data["validated_disease_counts_24h"] = []
+
+    try:
+        from .coolio_auto_ingest import enrich_realtime_for_coolio_live
+
+        enrich_realtime_for_coolio_live(data)
+    except Exception:
+        data.setdefault("coolio_live", None)
+        data.setdefault("coolio_signal_nudge", 0.0)
+
+    try:
+        from .coolio_signal_lens import enrich_realtime_with_coolio_signal_lens
+
+        enrich_realtime_with_coolio_signal_lens(data)
+    except Exception:
+        data.setdefault("coolio_signal_lens", {})
+        data.setdefault("coolio_verified_events", [])
 
     # Single source of truth for every dashboard KPI — keeps numbers consistent
     # across Home / Strategic signals / Executive brief / Action Plan / Global Surveillance.
@@ -915,7 +979,17 @@ def compute_dashboard_metrics(realtime_data: dict) -> dict:
     open_web_component = min(25.0, open_web_total / 6.0)    # 0-25 from open-web volume (≥150 saturates)
     official_component = min(25.0, official_total / 1.5)    # 0-25 from official feeds (≥38 saturates)
     reliability_component = feed_reliability * 15.0         # 0-15 from feed connectivity
-    signal_score = int(round(news_component + open_web_component + official_component + reliability_component))
+    coolio_component = float(realtime_data.get("coolio_signal_nudge", 0.0) or 0.0)
+    coolio_component = max(0.0, min(8.0, coolio_component))
+    signal_score = int(
+        round(
+            news_component
+            + open_web_component
+            + official_component
+            + reliability_component
+            + coolio_component
+        )
+    )
     signal_score = max(0, min(100, signal_score))
 
     if signal_score >= 75:
@@ -952,6 +1026,43 @@ def compute_dashboard_metrics(realtime_data: dict) -> dict:
         {"label": "Official feeds (24h)", "value": official_total, "weight_pct": int(round(official_component / 100 * 100))},
         {"label": "Feed connectivity", "value": f"{feeds_online}/{feeds_total}", "weight_pct": int(round(reliability_component / 100 * 100))},
     ]
+    coolio_live = realtime_data.get("coolio_live")
+    if isinstance(coolio_live, dict) and coolio_live.get("ok"):
+        drivers.append(
+            {
+                "label": "Coolio • OWID COVID (smoothed new cases / day)",
+                "value": int(round(float(coolio_live.get("new_cases_smoothed") or 0))),
+                "weight_pct": int(round(coolio_component)),
+            }
+        )
+
+    lens = realtime_data.get("coolio_signal_lens")
+    if isinstance(lens, dict) and int(lens.get("official_count") or 0) > 0:
+        oc = int(lens["official_count"])
+        drivers.append(
+            {
+                "label": f"Coolio • Official-feed validated signals ({int(lens.get('window_hours') or 72)}h window)",
+                "value": oc,
+                "weight_pct": min(12, max(2, oc)),
+            }
+        )
+
+    vd24_raw = realtime_data.get("validated_disease_counts_24h")
+    vd24: list = []
+    if isinstance(vd24_raw, list):
+        vd24 = [x for x in vd24_raw if isinstance(x, dict)]
+    emerging_validated_diseases_24h = [
+        x
+        for x in vd24
+        if int(x.get("count") or 0) > 0
+        and str(x.get("disease") or "").strip()
+        and not is_priority_disease(str(x.get("disease") or ""))
+    ]
+
+    lens_ct = realtime_data.get("coolio_signal_lens")
+    lens_official = int(lens_ct.get("official_count") or 0) if isinstance(lens_ct, dict) else 0
+    lens_window = int(lens_ct.get("validated_in_window") or 0) if isinstance(lens_ct, dict) else 0
+    lens_wh = int(lens_ct.get("window_hours") or 72) if isinstance(lens_ct, dict) else 72
 
     return {
         "signal_score": signal_score,
@@ -976,9 +1087,15 @@ def compute_dashboard_metrics(realtime_data: dict) -> dict:
             "open_web": round(open_web_component, 1),
             "official": round(official_component, 1),
             "reliability": round(reliability_component, 1),
+            "coolio_owid": round(coolio_component, 1),
         },
         "validated_signals_24h": int(realtime_data.get("validated_signals_24h", 0) or 0),
+        "validated_disease_counts_24h": vd24,
+        "emerging_validated_diseases_24h": emerging_validated_diseases_24h,
         "snapshot_utc": str(realtime_data.get("snapshot_utc") or ""),
+        "coolio_lens_official_count": lens_official,
+        "coolio_lens_validated_window": lens_window,
+        "coolio_lens_window_hours": lens_wh,
     }
 
 
@@ -1082,6 +1199,19 @@ def generate_ai_nlp_alerts(
         "NLP Alert • Recommendation: tighten surveillance reporting cycle to every 24 hours.",
     ]
 
+    if no_ai_mode():
+        try:
+            vs24 = int(_count_recent_signals(24))
+        except Exception:
+            vs24 = 0
+        return nlp_alerts_statistical(
+            disease,
+            news_mentions,
+            cholera_cases,
+            affected_countries,
+            validated_signals_24h=vs24,
+        )
+
     api_server_url = os.getenv("ALERTS_API_URL", "http://127.0.0.1:8000/v1/nlp-alerts")
     try:
         api_response = requests.post(
@@ -1102,12 +1232,22 @@ def generate_ai_nlp_alerts(
             normalized = []
             for line in alerts[:4]:
                 line = str(line).strip()
-                if not line.startswith("NLP Alert"):
-                    line = f"NLP Alert • {line}"
-                normalized.append(line)
+                if source == "statistical" or line.startswith("Stat •"):
+                    normalized.append(line)
+                else:
+                    if not line.startswith("NLP Alert"):
+                        line = f"NLP Alert • {line}"
+                    normalized.append(line)
             if len(normalized) < 4:
                 normalized.extend(fallback_alerts[: 4 - len(normalized)])
-            return normalized[:4], ("ai" if source == "ai" else "fallback")
+            src = str(source or "fallback")
+            if src == "ai":
+                tag = "ai"
+            elif src == "statistical":
+                tag = "statistical"
+            else:
+                tag = "fallback"
+            return normalized[:4], tag
     except Exception:
         pass
 
@@ -1643,6 +1783,77 @@ def list_validated_signal_diseases(min_count: int = 1) -> list[str]:
         return []
 
 
+def _run_naive_signal_forecast(
+    *,
+    disease: str | None,
+    horizon_days: int,
+    lookback_days: int,
+    daily_sparse: pd.DataFrame,
+    min_rf_days: int,
+) -> dict:
+    """Damped momentum on recent level when Random Forest cannot run (<14 distinct days)."""
+    rows_sparse = int(len(daily_sparse))
+    daily = daily_sparse.copy()
+    daily["date"] = pd.to_datetime(daily["date"])
+    daily = daily.set_index("date").asfreq("D", fill_value=0).reset_index()
+    daily = daily.rename(columns={"index": "date"})
+
+    y = daily["count"].astype(float)
+    last_date = pd.to_datetime(daily["date"].iloc[-1])
+    window = min(14, max(3, len(y)))
+    level = float(y.tail(window).mean())
+    last_v = float(y.iloc[-1])
+    prev_slice = y.iloc[-window:-1] if len(y) > 1 else y.iloc[-1:]
+    prev_mean = float(prev_slice.mean()) if len(prev_slice) else last_v
+    momentum = (last_v - prev_mean) / max(1.0, prev_mean)
+    momentum = float(max(-0.4, min(0.4, momentum)))
+    std = float(y.tail(window).std() or 0.0)
+    band = max(0.5, 1.28 * std)
+
+    series_pred = last_v
+    forecast_rows: list[dict] = []
+    for step in range(int(horizon_days)):
+        future_date = last_date + timedelta(days=step + 1)
+        series_pred = max(
+            0.0,
+            series_pred * (1 + momentum * 0.12) + 0.06 * (level - series_pred),
+        )
+        forecast_rows.append(
+            {
+                "date": future_date.normalize(),
+                "predicted": round(series_pred, 2),
+                "lower": round(max(0.0, series_pred - band), 2),
+                "upper": round(series_pred + band, 2),
+            }
+        )
+
+    forecast_df = pd.DataFrame(forecast_rows)
+    if not forecast_df.empty:
+        forecast_df["date"] = pd.to_datetime(forecast_df["date"])
+
+    return {
+        "ok": True,
+        "reason": "",
+        "history": daily,
+        "forecast": forecast_df,
+        "feature_importance": [
+            {"feature": "recent_level (naive blend)", "importance": 0.55},
+            {"feature": "short_momentum (naive)", "importance": 0.45},
+        ],
+        "backtest": {"mae": None, "mape": None, "n": 0},
+        "disease": disease or "All",
+        "horizon_days": int(horizon_days),
+        "lookback_days": int(lookback_days),
+        "min_history_days": int(min_rf_days),
+        "rows_available": rows_sparse,
+        "forecast_method": "naive_momentum",
+        "forecast_note": (
+            f"Random Forest needs at least {min_rf_days} day(s) of history; "
+            "using a non-ML damped-momentum extrapolation from available counts."
+        ),
+    }
+
+
 def run_signal_forecast(
     disease: str | None = None,
     horizon_days: int = 14,
@@ -1654,6 +1865,10 @@ def run_signal_forecast(
 
     This replaces the Excel-based trainer for Forecast Lab — the model now
     learns directly from real, validated outbreak signals as they accumulate.
+
+    Set EPFORECAST_SIGNAL_FORECAST_ENGINE=coolio to use the **Coolio** ensemble
+    (Random Forest + HistGradientBoosting, optional OWID merge for COVID). OpenAI-
+    compatible keys still drive validation/NLP text; see ``coolio_capabilities``.
 
     Returns a dict with keys:
         ok                    bool
@@ -1668,6 +1883,16 @@ def run_signal_forecast(
         min_history_days      int
         rows_available        int
     """
+    eng = (os.getenv("EPFORECAST_SIGNAL_FORECAST_ENGINE") or "").strip().lower()
+    if eng in ("coolio", "coolio1"):
+        from .coolio_engine import run_coolio_signal_forecast
+
+        return run_coolio_signal_forecast(
+            disease=disease,
+            horizon_days=horizon_days,
+            lookback_days=lookback_days,
+        )
+
     from sklearn.ensemble import RandomForestRegressor
     import numpy as np
 
@@ -1688,13 +1913,26 @@ def run_signal_forecast(
         "lookback_days": int(lookback_days),
         "min_history_days": MIN_HISTORY_DAYS,
         "rows_available": rows_available,
+        "forecast_method": "random_forest",
+        "forecast_note": "",
     }
 
-    if daily.empty or rows_available < MIN_HISTORY_DAYS:
+    if daily.empty:
+        base_payload["reason"] = "No validated signal days in the selected lookback window."
+        return base_payload
+
+    if rows_available < MIN_HISTORY_DAYS:
+        if rows_available >= 3:
+            return _run_naive_signal_forecast(
+                disease=disease,
+                horizon_days=int(horizon_days),
+                lookback_days=int(lookback_days),
+                daily_sparse=daily,
+                min_rf_days=MIN_HISTORY_DAYS,
+            )
         base_payload["reason"] = (
             f"Not enough validated signal history yet "
-            f"({rows_available} day(s) collected, need {MIN_HISTORY_DAYS}). "
-            "Forecast Lab unlocks once the live feed pipeline accumulates enough signals."
+            f"({rows_available} day(s) collected, need 3 for a naive forecast or {MIN_HISTORY_DAYS} for Random Forest)."
         )
         return base_payload
 
@@ -1791,6 +2029,8 @@ def run_signal_forecast(
         "lookback_days": int(lookback_days),
         "min_history_days": MIN_HISTORY_DAYS,
         "rows_available": rows_available,
+        "forecast_method": "random_forest",
+        "forecast_note": "",
     }
 
 

@@ -10,6 +10,9 @@ __pycache__/
 .cache/
 .vscode/
 mobile-app/node_modules/
+web/node_modules/
+web/.next/
+web/out/
 .expo/
 .streamlit/secrets.toml
 uploads/
@@ -17,6 +20,9 @@ uploads/
 admin_alerts_config.json
 # Local SQLite signal store (do not commit)
 data/*.db
+# Coolio / OWID download cache
+data/coolio_cache/
+data/coolio_memory/
 # OS / editor noise
 .DS_Store
 Thumbs.db

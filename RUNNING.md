@@ -2,6 +2,30 @@
 
 
 
+## Web UI on Vercel (Next.js)
+
+The **Streamlit** app under `frontend/` is not compatible with Vercel. The new shell lives in **`web/`** (Next.js 14).
+
+1. Deploy the repo to Vercel and set the project **Root Directory** to **`web`** (or connect the repo and choose `web` as the root when importing).
+2. In Vercel → *Settings → Environment Variables*, set **`API_URL`** to your **public FastAPI base URL** (no trailing slash), for example `https://epiforecast-api.onrender.com`.
+3. On the FastAPI host, set **`API_CORS_ORIGINS`** to your Vercel origin(s), comma-separated, e.g. `https://your-app.vercel.app,http://localhost:3000`.
+
+Run Next locally from `web/`:
+
+```powershell
+cd .\web
+copy .env.example .env
+# edit .env — API_URL should match where uvicorn is listening
+npm install
+npm run dev
+```
+
+Open http://localhost:3000 — the home page calls **`GET /health`** on the FastAPI server.
+
+**Important:** Keep **`uvicorn backend.api_server:app`** (or your process wrapper) running on a **long-lived** host (Render, Fly.io, Railway, a VM, etc.). Vercel only serves the Next.js frontend in this layout.
+
+
+
 ## Start API + Dashboard + Expo (Windows PowerShell)
 
 

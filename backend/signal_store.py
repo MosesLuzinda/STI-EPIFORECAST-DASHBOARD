@@ -3,7 +3,8 @@ SQLite-backed store of validated outbreak signals.
 
 Every accepted feed item (after the AI validator approves it) is appended
 here so the signal-trained forecast model can train on multi-day history
-instead of a single 24h snapshot.
+instead of a single 24h snapshot. Default file: `data/signals.db` under the
+repository root (see `backend/project_paths.PROJECT_ROOT`).
 
 Schema (table `signals`):
     id          INTEGER PRIMARY KEY
@@ -22,6 +23,7 @@ Public API:
     append_signals(rows)         -> int (rows inserted)
     count_recent(hours)          -> int
     list_diseases(min_count)     -> list[str]
+    disease_counts_recent(hours, min_count) -> list[tuple[str, int]]
     load_signal_history(days)    -> DataFrame
     daily_aggregate(disease, days) -> DataFrame[date, count]
 """
@@ -36,10 +38,7 @@ from pathlib import Path
 
 import pandas as pd
 
-# Always resolve the default DB to this package directory (project root), not
-# the process current working directory — so `streamlit run` from any folder
-# still shares one `data/signals.db` and live/validated signal counts match.
-_ROOT = Path(__file__).resolve().parent
+from .project_paths import PROJECT_ROOT
 
 
 def _resolved_db_path() -> Path:
@@ -47,7 +46,7 @@ def _resolved_db_path() -> Path:
     p = Path(raw)
     if p.is_absolute():
         return p
-    return (_ROOT / p).resolve()
+    return (PROJECT_ROOT / p).resolve()
 
 
 DB_PATH = _resolved_db_path()
@@ -168,6 +167,66 @@ def list_diseases(min_count: int = 5) -> list[str]:
         return [str(r[0]) for r in cur.fetchall()]
 
 
+def disease_counts_recent(hours: int = 24, min_count: int = 1) -> list[tuple[str, int]]:
+    """Per-disease counts of validated signals in the rolling window (UTC)."""
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=int(hours))).replace(microsecond=0).isoformat()
+    with _conn() as con:
+        cur = con.execute(
+            """
+            SELECT disease, COUNT(*) AS n
+            FROM signals
+            WHERE ts >= ?
+              AND disease IS NOT NULL
+              AND TRIM(disease) <> ''
+            GROUP BY disease
+            HAVING n >= ?
+            ORDER BY n DESC
+            """,
+            (cutoff, int(min_count)),
+        )
+        return [(str(r[0]), int(r[1])) for r in cur.fetchall()]
+
+
+def count_disease_recent_hours(disease: str, hours: int = 24) -> int:
+    """Count validated signals for one disease label in a rolling UTC window."""
+    label = str(disease or "").strip()
+    if not label:
+        return 0
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=int(hours))).replace(microsecond=0).isoformat()
+    with _conn() as con:
+        cur = con.execute(
+            """
+            SELECT COUNT(*) FROM signals
+            WHERE ts >= ? AND LOWER(TRIM(disease)) = LOWER(TRIM(?))
+            """,
+            (cutoff, label),
+        )
+        return int(cur.fetchone()[0])
+
+
+def fetch_recent_validated_signals(hours: int = 72, limit: int = 120) -> list[dict]:
+    """Recent validator-approved rows (newest first). Used by Coolio dashboard lens."""
+    init_db()
+    h = max(1, int(hours))
+    lim = max(1, min(500, int(limit)))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=h)).replace(microsecond=0).isoformat()
+    with _conn() as con:
+        cur = con.execute(
+            """
+            SELECT ts, source, title, url, disease, location, confidence, engine
+            FROM signals
+            WHERE ts >= ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (cutoff, lim),
+        )
+        cols = ["ts", "source", "title", "url", "disease", "location", "confidence", "engine"]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
 def load_signal_history(days: int = 90) -> pd.DataFrame:
     """Return validated signals within the lookback window as a DataFrame."""
     init_db()
@@ -191,9 +250,25 @@ def load_signal_history(days: int = 90) -> pd.DataFrame:
     return df
 
 
-def daily_aggregate(disease: str | None = None, days: int = 90) -> pd.DataFrame:
-    """Daily counts (optionally filtered by disease) ready for time-series modelling."""
+def daily_aggregate(
+    disease: str | None = None,
+    days: int = 90,
+    *,
+    source_tier_filter: frozenset[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Daily counts (optionally filtered by disease) ready for time-series modelling.
+
+    ``source_tier_filter`` when set (e.g. ``frozenset({"official"})``) keeps only
+    rows whose ``source`` label maps to that tier; see ``coolio_sources.source_tier``.
+    """
+    from .coolio_sources import source_tier
+
     df = load_signal_history(days=days)
+    if df.empty:
+        return pd.DataFrame(columns=["date", "count"])
+    if source_tier_filter:
+        df = df[df["source"].map(lambda s: source_tier(str(s)) in source_tier_filter)]
     if df.empty:
         return pd.DataFrame(columns=["date", "count"])
     if disease:

@@ -4,7 +4,6 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -14,9 +13,12 @@ from fastapi import FastAPI, HTTPException, Request as StarletteRequest
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from ai_config import llm_openai_compatible_chain, openai_compatible_env_credentials
+from .ai_config import llm_openai_compatible_chain, openai_compatible_env_credentials
+from .project_paths import PROJECT_ROOT
+from .signal_store import count_recent as _signal_count_recent
+from .statistical_forecast import no_ai_mode, nlp_alerts_statistical
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class AlertRequest(BaseModel):
@@ -27,7 +29,7 @@ class AlertRequest(BaseModel):
 
 
 class AlertResponse(BaseModel):
-    source: Literal["ai", "fallback"]
+    source: Literal["ai", "fallback", "statistical"]
     model: str
     alerts: List[str]
 
@@ -64,6 +66,26 @@ app = FastAPI(
         "This is not an official Cursor IDE product API."
     ),
 )
+
+
+def _cors_allow_origins() -> list[str]:
+    raw = (os.getenv("API_CORS_ORIGINS") or "").strip()
+    if not raw:
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+_cors_origins = _cors_allow_origins()
+if _cors_origins:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -225,7 +247,24 @@ def _public_api_catalog() -> Dict[str, Any]:
         "project": "Pathogen Economy Epiforecast",
         "note": "Cursor the IDE does not publish a public HTTP API for chat. Use OpenAI-compatible providers below.",
         "llm_openai_compatible": [
+            {
+                "name": "Self-hosted / Ollama (zero API spend)",
+                "base_url": "http://localhost:11434/v1",
+                "signup": "https://ollama.com/",
+                "env": ["LOCAL_LLM_URL", "OLLAMA_BASE_URL", "LOCAL_LLM_MODEL"],
+            },
+            {
+                "name": "LiteLLM proxy (OpenAI-compatible → many providers)",
+                "base_url": "http://localhost:4000/v1",
+                "signup": "https://docs.litellm.ai/",
+            },
             {"name": "OpenAI", "base_url": "https://api.openai.com/v1", "signup": "https://platform.openai.com/"},
+            {
+                "name": "Google AI Studio (Gemini)",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "signup": "https://aistudio.google.com/",
+                "env_aliases": ["GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "AI_API_KEY"],
+            },
             {"name": "xAI", "base_url": "https://api.x.ai/v1", "signup": "https://console.x.ai/"},
             {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "signup": "https://console.groq.com/"},
             {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "signup": "https://openrouter.ai/"},
@@ -484,6 +523,19 @@ def cursor_style_chat(body: CursorChatRequest):
 
 @app.post("/v1/nlp-alerts", response_model=AlertResponse)
 def nlp_alerts(request: AlertRequest):
+    if no_ai_mode():
+        try:
+            vs24 = int(_signal_count_recent(24))
+        except Exception:
+            vs24 = 0
+        lines, _ = nlp_alerts_statistical(
+            request.disease,
+            request.news_mentions,
+            request.cholera_cases,
+            request.affected_countries,
+            validated_signals_24h=vs24,
+        )
+        return AlertResponse(source="statistical", model="rules-thresholds", alerts=lines)
     result = _call_ai_for_alerts(request)
     return AlertResponse(**result)
 

@@ -34,12 +34,15 @@ Configuration (env vars, all optional):
     SIGNAL_VALIDATOR_CACHE_TTL_SEC    default 86400
     SIGNAL_VALIDATOR_LLM_TIMEOUT      default 20
     SIGNAL_VALIDATOR_BATCH_SIZE       default 8
-    CURSOR_API_KEY / AI_API_KEY / OPENAI_API_KEY / XAI_API_KEY
+    CURSOR_API_KEY / AI_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / GOOGLE_AI_API_KEY / XAI_API_KEY
     CURSOR_API_BASE_URL / AI_BASE_URL / OPENAI_BASE_URL
     CURSOR_AI_MODEL / AI_MODEL
     AI_FAILOVER_API_KEY / GROQ_API_KEY  (optional Groq failover)
     AI_FAILOVER_BASE_URL / GROQ_BASE_URL (optional; default Groq OpenAI-compatible host)
     AI_FAILOVER_MODEL / GROQ_MODEL       (optional; defaults per host)
+
+    Zero-cost mode: LOCAL_LLM_URL or OLLAMA_BASE_URL (see backend/ai_config.py)
+    SIGNAL_VALIDATOR_UGANDA_LOCALITIES  default 1 — heuristic place hints (e.g. Kampala)
 """
 from __future__ import annotations
 
@@ -52,19 +55,8 @@ from typing import Iterable
 
 import requests
 
-from ai_config import llm_openai_compatible_chain
-
-
-# Outbreak / disease vocabulary used as the cheap pre-filter. Kept in sync
-# with the legacy list in data_services.py so the historical behaviour is
-# preserved when the LLM is unavailable.
-_OUTBREAK_KEYWORDS: tuple[str, ...] = (
-    "outbreak", "epidemic", "pandemic", "cholera", "malaria", "ebola",
-    "marburg", "dengue", "influenza", "h5n1", "h7n9", "covid", "mpox",
-    "measles", "rabies", "yellow fever", "polio", "lassa", "anthrax",
-    "typhoid", "rift valley", "zika", "rsv", "tuberculosis", "hiv",
-    "diphtheria", "meningitis", "leptospirosis",
-)
+from .ai_config import llm_openai_compatible_chain
+from .statistical_forecast import OUTBREAK_KEYWORDS as _OUTBREAK_KEYWORDS
 
 
 def _env_int(name: str, default: int) -> int:
@@ -93,11 +85,80 @@ _CACHE_TTL_SEC = _env_int("SIGNAL_VALIDATOR_CACHE_TTL_SEC", 86_400)
 _LLM_TIMEOUT_SEC = _env_float("SIGNAL_VALIDATOR_LLM_TIMEOUT", 11.0)
 _BATCH_SIZE = max(1, _env_int("SIGNAL_VALIDATOR_BATCH_SIZE", 10))
 _MAX_PENDING_ITEMS = max(1, _env_int("SIGNAL_VALIDATOR_MAX_PENDING_ITEMS", 120))
-_DISABLE_LLM = _env_bool("SIGNAL_VALIDATOR_DISABLE_LLM", False)
+_DISABLE_LLM = _env_bool("SIGNAL_VALIDATOR_DISABLE_LLM", False) or _env_bool("EPFORECAST_NO_AI", False)
 _BUDGET_WINDOW_SEC = 60.0
 _MIN_ACCEPT_CONFIDENCE = max(0.0, min(1.0, _env_float("SIGNAL_VALIDATOR_MIN_ACCEPT_CONFIDENCE", 0.35)))
 _MAX_CACHE_ENTRIES = max(200, _env_int("SIGNAL_VALIDATOR_MAX_CACHE_ENTRIES", 5000))
 _HTTP_SESSION = requests.Session()
+
+# Longer phrases first so "fort portal" wins over "tororo".
+_UGANDA_PLACE_LABELS: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        (
+            ("fort portal", "Fort Portal"),
+            ("kira municipality", "Kira"),
+            ("kampala", "Kampala"),
+            ("mbarara", "Mbarara"),
+            ("gulu", "Gulu"),
+            ("jinja", "Jinja"),
+            ("entebbe", "Entebbe"),
+            ("lira", "Lira"),
+            ("mbale", "Mbale"),
+            ("mubende", "Mubende"),
+            ("kasese", "Kasese"),
+            ("arua", "Arua"),
+            ("soroti", "Soroti"),
+            ("tororo", "Tororo"),
+            ("hoima", "Hoima"),
+            ("mukono", "Mukono"),
+            ("wakiso", "Wakiso"),
+            ("nansana", "Nansana"),
+            ("busia", "Busia"),
+            ("iganga", "Iganga"),
+            ("kabale", "Kabale"),
+            ("masaka", "Masaka"),
+            ("moroto", "Moroto"),
+            ("kotido", "Kotido"),
+            ("adjumani", "Adjumani"),
+            ("apac", "Apac"),
+            ("bundibugyo", "Bundibugyo"),
+            ("kamuli", "Kamuli"),
+            ("kayunga", "Kayunga"),
+            ("luweero", "Luweero"),
+            ("mpigi", "Mpigi"),
+            ("mityana", "Mityana"),
+            ("nakaseke", "Nakaseke"),
+            ("nakasongola", "Nakasongola"),
+            ("pader", "Pader"),
+            ("rukungiri", "Rukungiri"),
+            ("sembabule", "Sembabule"),
+            ("nebbi", "Nebbi"),
+            ("paidha", "Paidha"),
+        ),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+)
+
+
+def _infer_uganda_locality(text: str) -> str:
+    if not _env_bool("SIGNAL_VALIDATOR_UGANDA_LOCALITIES", True):
+        return ""
+    lower = (text or "").lower()
+    if not lower:
+        return ""
+    for needle, label in _UGANDA_PLACE_LABELS:
+        if needle in lower:
+            return label
+    return ""
+
+
+def _merge_locality(decision: dict, text: str) -> None:
+    if str(decision.get("location") or "").strip():
+        return
+    hint = _infer_uganda_locality(text)
+    if hint:
+        decision["location"] = hint
 
 
 _cache: dict[str, tuple[float, dict]] = {}
@@ -180,15 +241,7 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _strip_code_fence(text: str) -> str:
-    blob = text.strip()
-    if blob.startswith("```"):
-        parts = blob.split("```", 2)
-        if len(parts) >= 2:
-            blob = parts[1]
-            if blob.lower().startswith("json"):
-                blob = blob[4:]
-    return blob.strip()
+from .json_extract import strip_markdown_fence as _strip_code_fence  # shared helper
 
 
 def _llm_classify_batch(items: list[dict]) -> list[dict | None] | None:
@@ -249,7 +302,7 @@ def _llm_classify_batch(items: list[dict]) -> list[dict | None] | None:
                 confidence = float(entry.get("confidence") or 0.0)
             except (TypeError, ValueError):
                 confidence = 0.0
-            out[idx] = {
+            row = {
                 "is_signal": bool(entry.get("is_signal")),
                 "confidence": max(0.0, min(1.0, confidence)),
                 "disease": str(entry.get("disease") or "").strip()[:60],
@@ -257,6 +310,16 @@ def _llm_classify_batch(items: list[dict]) -> list[dict | None] | None:
                 "reason": str(entry.get("reason") or "").strip()[:240],
                 "engine": "llm",
             }
+            it = items[idx]
+            blob = " ".join(
+                [
+                    str(it.get("title") or ""),
+                    str(it.get("description") or ""),
+                    str(it.get("meta") or ""),
+                ]
+            )
+            _merge_locality(row, blob)
+            out[idx] = row
         return out
 
     return None
@@ -318,6 +381,7 @@ def validate_signals_batch(items: Iterable[dict]) -> list[dict]:
             "reason": "keyword pre-filter" if kw_hit else "no keyword match",
             "engine": "keyword",
         }
+        _merge_locality(decisions[idx], text)
         if kw_hit:
             pending_indices.append(idx)
             pending_by_hash.setdefault(key, []).append(idx)
@@ -360,6 +424,14 @@ def validate_signals_batch(items: Iterable[dict]) -> list[dict]:
                 decisions[dup_idx] = dict(normalized)
 
     for idx, item in enumerate(items_list):
+        blob = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("description") or ""),
+                str(item.get("meta") or ""),
+            ]
+        )
+        _merge_locality(decisions[idx], blob)
         decisions[idx] = _apply_acceptance_policy(decisions[idx])
         _cache_set(_hash_key(item), decisions[idx])
 

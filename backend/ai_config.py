@@ -1,12 +1,15 @@
 """
-OpenAI-compatible API routing. xAI (Grok) keys are rejected by api.openai.com;
-if the key looks like an xAI key and the base URL still points at OpenAI, we
-route to https://api.x.ai/v1 automatically.
+OpenAI-compatible API routing. Supports **local zero-cost LLMs** (Ollama, LiteLLM
+proxy, vLLM, etc.) via `LOCAL_LLM_URL` / `OLLAMA_BASE_URL` — these take priority
+over all cloud keys when set.
 
-For Groq, set e.g. AI_MODEL=grok-2-latest (or your console’s model name).
+Cloud: xAI keys are rejected by api.openai.com; we route to https://api.x.ai/v1
+when appropriate.
 
-Failover: set AI_FAILOVER_API_KEY or GROQ_API_KEY (optional base/model) so
-chat, signal validation, NLP alerts, and the FastAPI proxy retry on errors.
+**Google AI Studio (Gemini):** see `.env.example`.
+
+Failover: `AI_FAILOVER_API_KEY` / `GROQ_*` adds a second OpenAI-compatible hop
+after the primary (local or cloud).
 """
 from __future__ import annotations
 
@@ -17,7 +20,8 @@ import requests
 
 _DEFAULT_OPENAI = "https://api.openai.com/v1"
 _XAI = "https://api.x.ai/v1"
-_GEMINI = "https://generativelanguage.googleapis.com/v1beta"
+_GEMINI_OPENAI_COMPAT = "https://generativelanguage.googleapis.com/v1beta/openai"
+_GEMINI_NATIVE = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _looks_like_openai_host(url: str) -> bool:
@@ -39,6 +43,9 @@ def _looks_like_openai_host(url: str) -> bool:
 def resolve_openai_compatible_base_url(api_key: str | None, explicit_base: str | None) -> str:
     k = (api_key or "").strip()
     b = (explicit_base or "").strip().rstrip("/")
+    if not b and k.startswith("AIza"):
+        # Google AI Studio keys must not hit api.openai.com; use Gemini OpenAI-compatible route.
+        return _GEMINI_OPENAI_COMPAT.rstrip("/")
     if not b:
         b = _DEFAULT_OPENAI
     if not k.startswith("xai-"):
@@ -52,12 +59,27 @@ def resolve_openai_compatible_base_url(api_key: str | None, explicit_base: str |
     return b
 
 
+def _looks_like_local_inference_host(url: str) -> bool:
+    """True for Ollama default port or loopback hosts (LiteLLM, vLLM on laptop, etc.)."""
+    u = (url or "").strip().lower()
+    if ":11434" in u or "/11434" in u:
+        return True
+    try:
+        p = u if u.startswith("http") else f"https://{u}"
+        host = urlparse(p).netloc.lower()
+        return "localhost" in host or host.startswith("127.0.0.1")
+    except Exception:
+        return False
+
+
 def default_chat_model_for_base_url(base_url: str) -> str:
     """
     When AI_MODEL is unset, pick a model that exists on the target host.
     xAI does not host gpt-4o-mini; use a Grok id from your xAI console if needed.
     """
     b = (base_url or "").lower()
+    if _looks_like_local_inference_host(base_url or ""):
+        return "llama3.2"
     if "generativelanguage.googleapis.com" in b:
         return "gemini-2.0-flash"
     if "api.x.ai" in b or b.rstrip("/").endswith("x.ai/v1"):
@@ -100,15 +122,42 @@ def llm_openai_compatible_chain() -> list[tuple[str, str, str]]:
     return chain
 
 
+def llm_configured() -> bool:
+    """
+    Single predicate for "is any LLM provider reachable from env?" used by Coolio
+    layers and the Streamlit info banners. Includes local URLs (Ollama, LiteLLM)
+    AND every cloud key (Cursor / OpenAI / Gemini / xAI).
+    """
+    if (os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_BASE_URL") or "").strip():
+        return True
+    api_key, _, _ = openai_compatible_env_credentials()
+    return bool((api_key or "").strip())
+
+
 def openai_compatible_env_credentials() -> tuple[str | None, str, str]:
     """
     One place for (api_key, base_url, model) used by Streamlit, FastAPI, the signal
-    validator, and Forecast Lab. Resolves xAI keys to https://api.x.ai/v1 when needed.
+    validator, and Forecast Lab. Local LLM URL wins when set; otherwise cloud keys.
     """
+    local_base = (os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_BASE_URL") or "").strip().rstrip("/")
+    if local_base:
+        local_key = (os.getenv("LOCAL_LLM_API_KEY") or os.getenv("OLLAMA_API_KEY") or "ollama").strip() or "ollama"
+        env_model = (
+            os.getenv("LOCAL_LLM_MODEL")
+            or os.getenv("OLLAMA_MODEL")
+            or os.getenv("CURSOR_AI_MODEL")
+            or os.getenv("AI_MODEL")
+            or ""
+        ).strip()
+        model = env_model or default_chat_model_for_base_url(local_base)
+        return local_key, local_base, model
+
     api_key = (
         os.getenv("CURSOR_API_KEY")
         or os.getenv("AI_API_KEY")
         or os.getenv("OPENAI_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_AI_API_KEY")
         or os.getenv("XAI_API_KEY")
     )
     explicit = (
@@ -124,15 +173,18 @@ def openai_compatible_env_credentials() -> tuple[str | None, str, str]:
 
 
 def _is_gemini_native(api_key: str | None, base_url: str) -> bool:
+    """Native generateContent API (not Google’s /openai-compatible surface)."""
     key = (api_key or "").strip()
     base = (base_url or "").strip().lower()
+    if "/openai" in base:
+        return False
     return key.startswith("AIza") or "generativelanguage.googleapis.com" in base
 
 
 def _gemini_native_base(base_url: str) -> str:
     base = (base_url or "").strip().rstrip("/")
     if not base:
-        return _GEMINI
+        return _GEMINI_NATIVE
     if base.endswith("/openai"):
         return base[: -len("/openai")]
     return base
@@ -200,7 +252,7 @@ def chat_text_from_messages(
 
     chain = llm_openai_compatible_chain()
     if not chain:
-        return None, "No AI API key configured"
+        return None, "No LLM configured (set LOCAL_LLM_URL for Ollama, or a cloud API key)"
 
     payload_template = {
         "messages": messages,

@@ -6,7 +6,7 @@ $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPython = Join-Path $projectRoot "venv\Scripts\python.exe"
 $py = if (Test-Path $venvPython) { "`"$venvPython`"" } else { "python" }
 $streamlitCmd = if (Test-Path $venvPython) { "& `"$venvPython`" -m streamlit run app.py" } else { "python -m streamlit run app.py" }
-$apiCmd = "& $py -m pip install -q fastapi uvicorn; & $py -m uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload"
+$apiCmd = "& $py -m pip install -q fastapi uvicorn; & $py -m uvicorn backend.api_server:app --host 0.0.0.0 --port 8000 --reload"
 
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd `"$projectRoot`"; $apiCmd"
 Start-Sleep -Seconds 1

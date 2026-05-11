@@ -1,13 +1,18 @@
 """Check .env API key is set and accepted (no secrets printed)."""
 import os
+import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import requests
 from dotenv import load_dotenv
 
-from ai_config import openai_compatible_env_credentials
+from backend.ai_config import openai_compatible_env_credentials
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(_ROOT / ".env")
 
 
 def mask(s: str) -> str:
@@ -24,12 +29,17 @@ def main() -> None:
         ("CURSOR_API_KEY", os.getenv("CURSOR_API_KEY")),
         ("AI_API_KEY", os.getenv("AI_API_KEY")),
         ("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY")),
+        ("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY")),
+        ("GOOGLE_AI_API_KEY", os.getenv("GOOGLE_AI_API_KEY")),
         ("XAI_API_KEY", os.getenv("XAI_API_KEY")),
     ]
     api_key_resolved, base, model = openai_compatible_env_credentials()
     base = (base or "").rstrip("/")
 
     print("--- Environment (masked) ---")
+    local_u = (os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_BASE_URL") or "").strip()
+    if local_u:
+        print("LOCAL_LLM / Ollama (env):", local_u[:96] + ("..." if len(local_u) > 96 else ""))
     for name, val in keys:
         if val and val.strip():
             print(f"{name}: SET  value: {mask(val)}")
@@ -49,7 +59,7 @@ def main() -> None:
 
     if not api_key_resolved:
         print()
-        print("RESULT: No API key found. Add OPENAI_API_KEY (or similar) to .env")
+        print("RESULT: No API key found. Set LOCAL_LLM_URL for Ollama, or add OPENAI_API_KEY (or similar) to .env")
         raise SystemExit(1)
 
     url = f"{base}/models"

@@ -1,5 +1,10 @@
 import os
+import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import numpy as np
 import pandas as pd
@@ -7,19 +12,25 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from data_services import (
+from backend.ai_config import llm_configured
+from backend.coolio_capabilities import format_capabilities_markdown
+from backend.data_services import (
     analyze_outbreak_risk,
     build_admin_update_message,
     compute_dashboard_metrics,
     generate_ai_nlp_alerts,
     get_signal_sources,
+    is_priority_disease,
     list_validated_signal_diseases,
     load_admin_alert_config,
     run_signal_forecast,
     save_admin_alert_config,
     send_admin_email,
 )
-from forecast_lab_four_disease import (
+from backend.disease_surveillance import get_disease_surveillance_snapshot
+from backend.statistical_forecast import no_ai_mode
+from backend.uganda_folium_maps import streamlit_folium_available
+from backend.forecast_lab_four_disease import (
     brief_to_burden_df,
     brief_to_heatmap_df,
     brief_to_radar_figure,
@@ -67,19 +78,15 @@ def render_signal_sources_panel(realtime_data: dict, *, key_suffix: str = "", de
             else:
                 st.markdown(f"{idx}. {title} · **{source}**{badge}{suffix}")
 
-    tab_labels = ["Open-web items", "Official feeds", "GDELT articles", "Source portals"]
+    tab_labels = ["News & social", "Agencies", "Press articles", "Source homepages"]
     tabs = st.tabs(tab_labels)
     with tabs[0]:
-        st.caption("Reddit posts, Hacker News stories, and GDELT articles — click any title to open the original source.")
         _render_items(open_web, "No open-web signal items in the current snapshot.")
     with tabs[1]:
-        st.caption("WHO Disease Outbreak News, CDC outbreak updates, and UN global health references.")
         _render_items(official, "No official feed items available right now.")
     with tabs[2]:
-        st.caption("Top GDELT-tracked outbreak news articles, sorted by recency.")
         _render_items(news, "No GDELT article links returned in the current snapshot.")
     with tabs[3]:
-        st.caption("Direct links to the upstream source portals used by the dashboard.")
         if not portals:
             st.info("No portal references configured.")
         else:
@@ -103,26 +110,133 @@ def _risk_level(score: float):
     return "Low", "#22c55e"
 
 
+NO_DISEASE_LABEL = "(no focus — pick a disease to watch)"
+
+
+def get_policy_disease() -> str:
+    """Single surveillance / forecast / alert focus — set from sidebar.
+
+    Returns ``""`` when the user has not selected a specific pathogen
+    (the sentinel ``NO_DISEASE_LABEL`` is treated as no focus). Pages that
+    require a focused disease should guard with ``if not get_policy_disease():``
+    and prompt the user to choose, rather than silently defaulting.
+    """
+    d = st.session_state.get("policy_disease")
+    s = (str(d).strip() if d is not None else "")
+    if not s or s == NO_DISEASE_LABEL:
+        return ""
+    return s
+
+
+def policy_disease_focused() -> bool:
+    return bool(get_policy_disease())
+
+
+def _canonical_disease_options() -> list[str]:
+    """Preset watchlist + core + validated store + current policy focus."""
+    core = ["Cholera", "Malaria", "Typhoid", "Marburg"]
+    presets = [
+        "Ebola",
+        "Measles",
+        "Dengue",
+        "COVID-19",
+        "Influenza",
+        "Polio",
+        "Yellow fever",
+        "Mpox",
+        "Lassa fever",
+        "Rift Valley fever",
+        "Anthrax",
+        "Meningitis",
+        "Chikungunya",
+        "Norovirus",
+        "H5N1",
+        "HIV",
+        "Tuberculosis",
+        "Leptospirosis",
+        "Plague",
+        "Zika",
+    ]
+    try:
+        extra = [x for x in list_validated_signal_diseases(min_count=1) if x]
+    except Exception:
+        extra = []
+    pol = get_policy_disease()
+    merged: list[str] = []
+    for x in core + presets + extra + [pol]:
+        if x and x not in merged:
+            merged.append(x)
+    merged.sort(key=lambda t: t.lower())
+    for preferred in (pol, "Cholera", "Malaria", "Typhoid", "Marburg"):
+        if preferred in merged:
+            merged.remove(preferred)
+            merged.insert(0, preferred)
+    return merged
+
+
+def _count_for_disease(vd24, disease: str) -> int:
+    for x in vd24 or []:
+        if not isinstance(x, dict):
+            continue
+        if str(x.get("disease") or "").strip().lower() == str(disease).strip().lower():
+            return int(x.get("count") or 0)
+    return 0
+
+
+def _nlp_inputs_scaled(
+    disease: str,
+    count_24h: int,
+    vd24,
+    realtime_data: dict,
+) -> tuple[int, int, int]:
+    """Scale snapshot KPIs so each disease gets its own NLP alert call with plausible inputs."""
+    base_nm = int(realtime_data.get("news_mentions", 0) or 0)
+    base_cc = int(realtime_data.get("cholera_cases", 0) or 38_000)
+    base_ac = int(realtime_data.get("affected_countries", 0) or 0)
+    counts_only = [int(x.get("count") or 0) for x in (vd24 or []) if isinstance(x, dict)]
+    max_c = max(counts_only) if counts_only else 1
+    priority = {"Cholera", "Malaria", "Typhoid", "Marburg"}
+    if disease in priority and count_24h <= 0:
+        return max(0, base_nm), max(0, base_cc), max(1, base_ac)
+    w = max(0.2, min(1.0, (count_24h if count_24h > 0 else 1) / max(max_c, 1)))
+    nm = int(base_nm * w) if base_nm else int(400 * w)
+    cc = int(base_cc * w) if base_cc else int(8_000 * w)
+    ac = int(base_ac * max(0.35, w)) if base_ac else max(2, int(6 * w))
+    return max(80, nm), max(400, cc), max(2, ac)
+
+
+def _render_disease_nlp_alerts_block(
+    *,
+    disease: str,
+    realtime_data: dict,
+    vd24,
+    cache_namespace: str,
+) -> None:
+    if "cached_nlp_alerts" not in st.session_state:
+        st.session_state["cached_nlp_alerts"] = {}
+    count_24h = _count_for_disease(vd24, disease)
+    nm, cc, ac = _nlp_inputs_scaled(disease, count_24h, vd24, realtime_data)
+    alert_key = (cache_namespace, disease, nm, cc, ac)
+    if alert_key not in st.session_state["cached_nlp_alerts"]:
+        st.session_state["cached_nlp_alerts"][alert_key] = generate_ai_nlp_alerts(
+            disease=disease,
+            news_mentions=nm,
+            cholera_cases=cc,
+            affected_countries=ac,
+        )
+    nlp_alerts, _ = st.session_state["cached_nlp_alerts"][alert_key]
+    for alert in nlp_alerts:
+        st.warning(alert)
+
+
 def _selected_disease():
-    canonical = ["Cholera", "Malaria", "Typhoid", "Marburg"]
-    pe = st.session_state.get("pe_disease")
-    default_disease = pe if pe in canonical else st.session_state.get("policy_disease", "Cholera")
-    if default_disease not in canonical:
-        default_disease = "Cholera"
-    disease = st.selectbox(
-        "Disease focus",
-        canonical,
-        index=canonical.index(default_disease),
-        key="disease_focus_select",
-    )
-    st.session_state["policy_disease"] = disease
-    return disease
+    """Disease focus for module pages — driven by sidebar `policy_disease` (any pathogen)."""
+    return get_policy_disease()
 
 
 def render_disease_explorer():
     st.title("🔬 Disease Profiler (Epidemiology)")
     disease = _selected_disease()
-    st.caption("Host profile, age-risk profile, and climate sensitivity are simulated for rapid planning.")
 
     host_profiles = {
         "Cholera": {"Humans": 85, "Animals": 10, "Birds": 5},
@@ -138,28 +252,38 @@ def render_disease_explorer():
     }
     climate_amplifier = {"Cholera": 1.15, "Malaria": 1.28, "Typhoid": 1.08, "Marburg": 1.12}
 
+    _ref = "Cholera"
+    hp = host_profiles.get(disease, host_profiles[_ref])
+    ap = age_profiles.get(disease, age_profiles[_ref])
+    ca = float(climate_amplifier.get(disease, climate_amplifier[_ref]))
+    if disease not in host_profiles:
+        st.info(
+            f"**{disease}** is not in the built-in profiler templates — showing **{_ref}**-shaped placeholders "
+            "until diseases-specific parameters are calibrated."
+        )
+
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Host Origin (Donut)")
         df_host = pd.DataFrame(
-            {"Host": list(host_profiles[disease].keys()), "Share": list(host_profiles[disease].values())}
+            {"Host": list(hp.keys()), "Share": list(hp.values())}
         )
         fig_host = px.pie(df_host, names="Host", values="Share", hole=0.62, title=f"{disease} host signal mix")
         fig_host.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_host, use_container_width=True)
+        st.plotly_chart(fig_host)
 
     with c2:
         st.subheader("Age Vulnerability (Bar)")
         age_groups = ["0-4", "5-14", "15-24", "25-49", "50+"]
-        df_age = pd.DataFrame({"Age Group": age_groups, "Risk Index": age_profiles[disease]})
+        df_age = pd.DataFrame({"Age Group": age_groups, "Risk Index": ap})
         fig_age = px.bar(df_age, x="Age Group", y="Risk Index", color="Risk Index", title=f"{disease} age-risk index")
         fig_age.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_age, use_container_width=True)
+        st.plotly_chart(fig_age)
 
     st.subheader("Environment Sensitivity (Line)")
     temps = np.arange(16, 37, 1)
     baseline = np.clip((temps - 16) * 2.2, 1, None)
-    env_risk = baseline * climate_amplifier[disease]
+    env_risk = baseline * ca
     df_env = pd.DataFrame({"Temperature C": temps, "Spread Potential": env_risk})
     fig_env = px.line(
         df_env,
@@ -170,7 +294,185 @@ def render_disease_explorer():
     )
     fig_env.update_traces(line_width=3, line_color="#22c55e")
     fig_env.update_layout(template="plotly_dark")
-    st.plotly_chart(fig_env, use_container_width=True)
+    st.plotly_chart(fig_env)
+
+
+def render_disease_surveillance_hub(realtime_data: dict | None):
+    """
+    Integrated surveillance + forecasting for the **active sidebar disease** (any pathogen name).
+    KPIs and anomaly detection use local `signals.db`; national context uses the live snapshot.
+    """
+    st.title("Track a disease")
+    st.caption(f"Watching **{get_policy_disease()}** — change it anytime in the sidebar under *Disease to watch everywhere*.")
+
+    disease = get_policy_disease()
+    snap = get_disease_surveillance_snapshot(disease, realtime_data)
+    dashboard = get_dashboard(realtime_data or {})
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Matched signals (24h)", f"{snap['validated_count_24h']:,}")
+    with m2:
+        st.metric("Matched signals (7d)", f"{snap['validated_count_7d']:,}")
+    with m3:
+        st.metric("National activity index", f"{dashboard.get('signal_score', 0)}/100", str(dashboard.get("posture", "—")))
+    with m4:
+        ann = snap.get("anomaly") or {}
+        flag = ann.get("flag", "—") if ann else "n/a"
+        st.metric("Compared to usual (14d)", flag, snap.get("trend_label", ""))
+
+    if snap.get("anomaly"):
+        a = snap["anomaly"]
+        st.info(
+            f"**Trend check:** **{a.get('last_day_count', 0)}** recent items vs a typical day around **"
+            f"{a.get('baseline_mean_14d_excl_last')}**. Treat as a hint only — confirm with official reports."
+        )
+
+    daily = snap.get("daily")
+    if daily is not None and not daily.empty:
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                x=pd.to_datetime(daily["date"]),
+                y=daily["count"],
+                name="Validated signals / day",
+                marker_color="#3b82f6",
+            )
+        )
+        fig.update_layout(
+            template="plotly_dark",
+            title=f"{disease} — daily validated signal counts (local store)",
+            xaxis_title="Date",
+            yaxis_title="Count",
+        )
+        st.plotly_chart(fig)
+    else:
+        st.warning(
+            f"No rows in `signals.db` for **{disease}** yet. Run the dashboard with live feeds (or imports) so the "
+            "validator can tag and persist items, or check the spelling matches stored disease labels."
+        )
+
+    vd24 = (realtime_data or {}).get("validated_disease_counts_24h") or []
+    st.subheader("Contextual risk lines (this pathogen)")
+    _render_disease_nlp_alerts_block(
+        disease=disease,
+        realtime_data=realtime_data or {},
+        vd24=vd24,
+        cache_namespace="surv_hub_nlp",
+    )
+
+    st.subheader("Signal-count forecast (disease-scoped)")
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        horizon = st.slider("Horizon (days)", 7, 30, 14, key="surv_hub_horizon")
+    with fc2:
+        lookback = st.slider("Lookback (days)", 30, 180, 90, key="surv_hub_lookback")
+    with fc3:
+        st.metric("Store label", disease)
+
+    try:
+        sig_result = run_signal_forecast(
+            disease=disease,
+            horizon_days=int(horizon),
+            lookback_days=int(lookback),
+        )
+    except Exception as exc:
+        st.warning(f"Forecast error: {exc}")
+        sig_result = None
+
+    if sig_result and not sig_result["ok"]:
+        st.info(sig_result.get("reason") or "Not enough history for forecast.")
+    elif sig_result and sig_result.get("ok"):
+        if (sig_result.get("forecast_method") or "") == "coolio_world_briefing":
+            fnote = (sig_result.get("forecast_note") or "").strip()
+            if fnote:
+                st.info(fnote)
+            nar = (sig_result.get("coolio_world_narrative") or sig_result.get("coolio_llm_analysis") or "").strip()
+            if nar:
+                st.subheader("Coolio · world context")
+                if (sig_result.get("coolio_llm_model") or "").strip():
+                    st.caption(
+                        f"LLM `{sig_result.get('coolio_llm_model')}` — synthesis tied to listed sources; "
+                        "not exhaustive real-time global surveillance."
+                    )
+                st.markdown(nar)
+            if (sig_result.get("coolio_llm_error") or "").strip():
+                st.caption(f"LLM note: {sig_result.get('coolio_llm_error')}")
+            srcs = sig_result.get("coolio_world_sources") or []
+            if srcs:
+                with st.expander("Sources (this run)", expanded=False):
+                    for s in srcs:
+                        u = (s.get("url") or "").strip()
+                        t = s.get("title") or "—"
+                        pub = s.get("publisher") or ""
+                        st.markdown(f"- **{pub}** · [{t}]({u})" if u else f"- **{pub}** · {t}")
+        else:
+            fnote = (sig_result.get("forecast_note") or "").strip()
+            if fnote:
+                st.info(fnote)
+            llm_analysis = (sig_result.get("coolio_llm_analysis") or "").strip()
+            llm_err = (sig_result.get("coolio_llm_error") or "").strip()
+            llm_model = (sig_result.get("coolio_llm_model") or "").strip()
+            if llm_analysis:
+                st.subheader("Coolio briefing (LLM)")
+                if llm_model:
+                    st.caption(f"Model: `{llm_model}` — synthesis only; numeric forecast is from the ensemble.")
+                st.markdown(llm_analysis)
+            elif llm_err and (sig_result.get("forecast_method") or "").lower().startswith("coolio"):
+                st.caption(f"Coolio LLM layer: {llm_err}")
+            forecast_df = sig_result.get("forecast") or pd.DataFrame()
+            hist_df = sig_result.get("history") or pd.DataFrame()
+            if hist_df is not None and not hist_df.empty and forecast_df is not None and not forecast_df.empty:
+                fig2 = go.Figure()
+                fig2.add_trace(
+                    go.Scatter(
+                        x=hist_df["date"],
+                        y=hist_df["count"],
+                        name="History",
+                        mode="lines+markers",
+                        line=dict(color="#22c55e"),
+                    )
+                )
+                fig2.add_trace(
+                    go.Scatter(
+                        x=forecast_df["date"],
+                        y=forecast_df["predicted"],
+                        name="Forecast",
+                        mode="lines+markers",
+                        line=dict(color="#fb923c", dash="dot"),
+                    )
+                )
+                fig2.update_layout(
+                    template="plotly_dark",
+                    title=f"{disease} — signal trajectory",
+                    xaxis_title="Date",
+                    yaxis_title="Validated signals / day",
+                )
+                st.plotly_chart(fig2)
+
+    st.subheader("Regional hotspot map (illustrative)")
+    df_map = regional_hotspot_dataframe(disease)
+    if streamlit_folium_available():
+        from streamlit_folium import st_folium
+
+        from backend.uganda_folium_maps import build_uganda_operational_map
+
+        _mh = build_uganda_operational_map(
+            df_map,
+            focus_disease=disease,
+            subtitle="Surveillance hub",
+            show_heatmap=True,
+            show_clinical_layer=True,
+        )
+        if _mh is not None:
+            st_folium(_mh, use_container_width=True, height=480, key="surv_hub_map")
+        else:
+            st.warning("Map could not be built.")
+    else:
+        st.info("Install **folium** and **streamlit-folium** for the interactive map.")
+
+    st.markdown("### National news links (not filtered to this disease)")
+    render_signal_sources_panel(realtime_data or {}, key_suffix="surv_hub")
 
 
 def _hotspot_scale(disease: str) -> float:
@@ -188,24 +490,13 @@ def _hotspot_scale(disease: str) -> float:
     return float(m.get(disease, 1.0))
 
 
-def render_region_watch():
-    st.title("📍 Uganda Vulnerability Map (Hotspots & Risk)")
-    focus = st.session_state.get("pe_disease") or _selected_disease()
-    st.caption(f"Spatial risk uses sidebar **Pathogen focus**: **{focus}** (scalar defaults for diseases not yet calibrated).")
-    districts = [
-        ("Kampala", 0.72),
-        ("Wakiso", 0.64),
-        ("Gulu", 0.58),
-        ("Arua", 0.61),
-        ("Mbale", 0.49),
-        ("Kasese", 0.68),
-        ("Mbarara", 0.45),
-        ("Lira", 0.53),
-    ]
-    scale = _hotspot_scale(focus)
+def regional_hotspot_dataframe(focus_disease: str) -> pd.DataFrame:
+    """District-level proxy risk table + map-ready rows (illustrative until DHIS2 feeds)."""
+    from backend.uganda_geospatial_data import default_hotspot_district_bases
 
+    scale = _hotspot_scale(focus_disease)
     records = []
-    for district, base_risk in districts:
+    for district, base_risk in default_hotspot_district_bases():
         risk = min(0.98, base_risk * scale)
         if risk >= 0.65:
             trend = "Rising"
@@ -222,7 +513,15 @@ def render_region_watch():
                 "Trend": trend,
             }
         )
-    df_risk = pd.DataFrame(records).sort_values("RiskScore", ascending=False)
+    return pd.DataFrame(records).sort_values("RiskScore", ascending=False)
+
+
+def render_region_watch():
+    st.title("Maps & hotspots")
+    st.caption(f"Using **{get_policy_disease()}** from the sidebar — ring sizes are planning aids, not official case data.")
+
+    focus = get_policy_disease()
+    df_risk = regional_hotspot_dataframe(focus)
 
     c1, c2 = st.columns([1.2, 1.8])
     with c1:
@@ -235,39 +534,54 @@ def render_region_watch():
             x="District",
             y="RiskScore",
             color="RiskLabel",
-            title=f"{focus} hotspot risk by district (UBOS shapefile-ready prototype)",
+            title=f"{focus} hotspot risk by district (centroid map below)",
             color_discrete_map={"High": "#ef4444", "Medium": "#f59e0b", "Low": "#22c55e"},
         )
         fig_hotspot.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_hotspot, use_container_width=True)
+        st.plotly_chart(fig_hotspot)
 
-    st.dataframe(df_risk, use_container_width=True)
+    st.dataframe(df_risk)
+
+    st.subheader("Uganda map")
+    if streamlit_folium_available():
+        from streamlit_folium import st_folium
+
+        from backend.uganda_folium_maps import build_uganda_operational_map
+
+        _m = build_uganda_operational_map(
+            df_risk,
+            focus_disease=focus,
+            subtitle="Hotspots + referral & trial sites",
+            show_heatmap=True,
+            show_clinical_layer=True,
+        )
+        if _m is not None:
+            st_folium(_m, use_container_width=True, height=560, key="uganda_hotspots_main_map")
+        else:
+            st.warning("Folium failed to initialize.")
+    else:
+        st.info("For maps: `pip install folium streamlit-folium`")
 
 
 def render_forecast_lab(realtime_data: dict | None = None):
     st.title("🔮 Uganda Vulnerability (SEIR + ML Signal)")
-    st.caption(
-        "Structured workflow: tune epidemiological assumptions, review transmission dynamics, "
-        "then validate ML outputs with incident history and live signal blending."
-    )
 
     st.subheader("AI four-disease public-health planning brief (Uganda)")
-    st.caption(
-        "Targets **Cholera, Malaria, Typhoid, and Marburg** with **causal domains** (environment, climate, "
-        "WASH, vectors, movement, border, health system) plus **Uganda** districts/subcounties and **EAC** context, "
-        "**relative** burden and forward indices, and **recommendations**. Synthesis is for early warning and planning — "
-        "calibrate to MoH, DHIS2, and EOC. Requires an AI key (see `.env` / host secrets)."
-    )
-    c_run, c_clr, c_ht = st.columns([1.25, 0.55, 1.0])
+    if no_ai_mode():
+        st.info(
+            "**Statistical mode:** causal matrices and narratives are **heuristic** (dashboard KPIs → 0–100 indices). "
+            "Set **EPFORECAST_OFFLINE_SNAPSHOT=1** to skip external feed HTTP and use only local `signals.db` tallies."
+        )
+    c_run, c_clr = st.columns([1.25, 1.0])
     with c_run:
         if st.button("🧠 Generate 4-disease analysis & visual comparison", type="primary", key="fl4_run"):
-            with st.spinner("AI cross-disease analysis (up to ~2 min)…"):
+            with st.spinner(
+                "Rule-based cross-disease brief…" if no_ai_mode() else "AI cross-disease analysis (up to ~2 min)…"
+            ):
                 st.session_state["fl4_result"] = generate_four_disease_brief_json(realtime_data or {})
     with c_clr:
         if st.button("Clear", key="fl4_clear"):
             st.session_state.pop("fl4_result", None)
-    with c_ht:
-        st.caption("Uses current **dashboard snapshot** (signals, feeds) + model estimates **0–100** (not case counts).")
 
     fl4 = st.session_state.get("fl4_result")
     if fl4 is not None:
@@ -299,8 +613,8 @@ def render_forecast_lab(realtime_data: dict | None = None):
                     title="Causal & driver index matrix — 4 priority diseases, 9 domains",
                 )
                 fig_heat.update_layout(template="plotly_dark")
-                st.plotly_chart(fig_heat, use_container_width=True)
-                st.plotly_chart(brief_to_radar_figure(br), use_container_width=True)
+                st.plotly_chart(fig_heat)
+                st.plotly_chart(brief_to_radar_figure(br))
                 nrs = br.get("disease_narrative")
                 if isinstance(nrs, dict):
                     for dname, txt in nrs.items():
@@ -323,18 +637,18 @@ def render_forecast_lab(realtime_data: dict | None = None):
                     title="Comparative burden and 6‑month relative forecast index (planning scale 0–100; not case counts)",
                 )
                 fig_bar.update_layout(template="plotly_dark")
-                st.plotly_chart(fig_bar, use_container_width=True)
+                st.plotly_chart(fig_bar)
                 urows = uganda_units_to_rows(br)
                 if urows:
                     st.markdown("**Uganda: districts / subcounties / regions (draft targeting)**")
-                    st.dataframe(pd.DataFrame(urows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(urows), hide_index=True)
             with t_c:
                 st.markdown("**East Africa / border context**")
                 st.markdown(str(br.get("eac_regional_patterns") or "_—_"))
                 st.markdown("**Prioritized decision recommendations (evidence-style)**")
                 rrows = recommendations_to_rows(br)
                 if rrows:
-                    st.dataframe(pd.DataFrame(rrows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(rrows), hide_index=True)
             with t_d:
                 st.warning(str(br.get("evidence_caveat") or "AI output is a planning aid, not official surveillance."))
                 st.info(str(br.get("data_limitations") or "—"))
@@ -411,7 +725,7 @@ def render_forecast_lab(realtime_data: dict | None = None):
         hovermode="x unified",
         transition={"duration": 450, "easing": "cubic-in-out"},
     )
-    st.plotly_chart(fig_curve, use_container_width=True)
+    st.plotly_chart(fig_curve)
 
     st.subheader("Travel Risk (Borders & Airport)")
     travel_df = pd.DataFrame(
@@ -429,7 +743,7 @@ def render_forecast_lab(realtime_data: dict | None = None):
         title="Entebbe, Malaba, Mpondwe, and Elegu travel corridor risk",
     )
     fig_travel.update_layout(template="plotly_dark")
-    st.plotly_chart(fig_travel, use_container_width=True)
+    st.plotly_chart(fig_travel)
 
     st.subheader("Statistical Normal Baseline")
     daily_new = np.diff(np.maximum(I, 0))
@@ -468,30 +782,41 @@ def render_forecast_lab(realtime_data: dict | None = None):
         template="plotly_dark",
         legend_title="Statistical legend",
     )
-    st.plotly_chart(fig_norm, use_container_width=True)
-    st.caption(
-        f"Normal baseline summary: mean={mu:,.0f}, std-dev={sigma:,.0f}. "
-        "Use this to detect abnormal surge behavior beyond expected variation."
-    )
+    st.plotly_chart(fig_norm)
 
-    st.subheader("Machine Learning Signal (AI-validated live signals + Random Forest)")
-    has_ai_key = bool(
-        (os.getenv("AI_API_KEY") or "").strip()
-        or (os.getenv("OPENAI_API_KEY") or "").strip()
-        or (os.getenv("CURSOR_API_KEY") or "").strip()
-        or (os.getenv("XAI_API_KEY") or "").strip()
+    _fc_eng = (os.getenv("EPFORECAST_SIGNAL_FORECAST_ENGINE") or "").strip().lower()
+    st.subheader(
+        "Machine Learning Signal (Coolio ensemble)"
+        if _fc_eng in ("coolio", "coolio1")
+        else "Machine Learning Signal (AI-validated live signals + Random Forest)"
     )
-    st.caption(
-        "Forecast Lab now trains directly on the live signal stream. Every feed item "
-        "(GDELT / Reddit / HN / WHO / CDC / CIDRAP / ReliefWeb / PAHO) is first run "
-        "through the AI signal validator; only items confirmed as real outbreak signals "
-        "are persisted to the signal store and used to train the model below."
+    if _fc_eng in ("coolio", "coolio1"):
+        st.caption(
+            "**Coolio** can run a **numeric ensemble** (RF + gradient boosting) on your **validator-approved** "
+            "`signals.db` series, with optional **OWID** merge for COVID-like diseases. "
+            "Set **`EPFORECAST_COOLIO_ML=0`** to skip that model and use **world context** only "
+            "(Wikipedia + WHO RSS + OWID + optional LLM). "
+            "When local history is thin, **`EPFORECAST_COOLIO_WORLD_FALLBACK=1`** (default) fills the gap with that world briefing "
+            "so the UI stays meaningful instead of empty. "
+            "LLM readout: `EPFORECAST_COOLIO_LLM=1` and `EPFORECAST_COOLIO_LLM_MODEL` for a strong model. "
+            "**Coolio commands**: use the sidebar **Coolio · commands** box (e.g. “take me home”). "
+            "**Memory**: world briefings can append to `data/coolio_memory/` for richer follow-up prompts (`EPFORECAST_COOLIO_MEMORY`)."
+        )
+    _fc_stack_title = (
+        "Coolio & AI stack — predictive engine, patterns, and language assist"
+        if _fc_eng in ("coolio", "coolio1")
+        else "Forecast & AI stack — engine, patterns, and optional LLM assist"
     )
-    if not has_ai_key:
+    with st.expander(_fc_stack_title, expanded=False):
+        st.markdown(
+            format_capabilities_markdown(coolio_engine_active=_fc_eng in ("coolio", "coolio1"))
+        )
+    if not llm_configured():
         st.info(
-            "AI validation is currently in fallback mode because no API key is configured. "
-            "Set AI_API_KEY (or OPENAI_API_KEY / CURSOR_API_KEY / XAI_API_KEY) to unlock "
-            "full live signal validation and richer open-web signal items."
+            "AI validation is currently in fallback mode because no LLM is configured. "
+            "Set any of: **AI_API_KEY** / OPENAI_API_KEY / CURSOR_API_KEY / GEMINI_API_KEY / "
+            "GOOGLE_AI_API_KEY / XAI_API_KEY, or run a local model and set **LOCAL_LLM_URL** "
+            "(Ollama / LiteLLM) to unlock live signal validation and richer open-web items."
         )
 
     available_diseases = list_validated_signal_diseases(min_count=1)
@@ -514,7 +839,6 @@ def render_forecast_lab(realtime_data: dict | None = None):
             "Forecast scope",
             disease_options,
             index=default_index,
-            help="Train on signals tagged with a specific disease or use the full validated stream.",
         )
     with fc2:
         horizon_days = st.slider("Forecast horizon (days)", 7, 30, 14)
@@ -538,136 +862,174 @@ def render_forecast_lab(realtime_data: dict | None = None):
         rows_available = int(sig_result.get("rows_available", 0))
         min_days = int(sig_result.get("min_history_days", 14))
         st.progress(min(1.0, rows_available / max(1, min_days)))
-        st.caption(
-            f"{rows_available} of {min_days} day(s) of validated signal history collected. "
-            "Keep the dashboard refreshing — every accepted feed item is persisted to "
-            "the signal store and accelerates this unlock."
-        )
     elif sig_result and sig_result["ok"]:
-        history_df = sig_result["history"].copy()
-        forecast_df = sig_result["forecast"].copy()
-        backtest = sig_result.get("backtest") or {}
-
-        history_total = int(history_df["count"].sum())
-        forecast_next7 = float(forecast_df.head(7)["predicted"].sum()) if not forecast_df.empty else 0.0
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric("Validated signals (history window)", f"{history_total:,}")
-        with m2:
-            st.metric("Forecasted signals (next 7d)", f"{forecast_next7:,.0f}")
-        with m3:
-            mae_val = backtest.get("mae")
-            st.metric(
-                "Backtest MAE",
-                f"{mae_val:.2f}" if isinstance(mae_val, (int, float)) else "—",
-                help=(
-                    f"Mean absolute error on the held-out tail "
-                    f"({backtest.get('n', 0)} day(s))."
-                ),
-            )
-
-        fig_pred = go.Figure()
-        fig_pred.add_trace(
-            go.Scatter(
-                x=history_df["date"],
-                y=history_df["count"],
-                name="Validated history",
-                mode="lines+markers",
-                line=dict(color="#22c55e", width=2),
-            )
-        )
-        if not forecast_df.empty:
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=forecast_df["date"],
-                    y=forecast_df["upper"],
-                    name="Upper band",
-                    mode="lines",
-                    line=dict(color="#fb923c", width=0),
-                    showlegend=False,
-                )
-            )
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=forecast_df["date"],
-                    y=forecast_df["lower"],
-                    name="Confidence band",
-                    mode="lines",
-                    fill="tonexty",
-                    line=dict(color="#fb923c", width=0),
-                    fillcolor="rgba(251,146,60,0.18)",
-                )
-            )
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=forecast_df["date"],
-                    y=forecast_df["predicted"],
-                    name="Forecast",
-                    mode="lines+markers",
-                    line=dict(color="#fb923c", width=3, dash="dot"),
-                )
-            )
-        fig_pred.update_layout(
-            title=f"AI-validated signal forecast — {sig_result['disease']}",
-            xaxis_title="Date",
-            yaxis_title="Validated signals / day",
-            template="plotly_dark",
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_pred, use_container_width=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            importance = sig_result.get("feature_importance") or []
-            if importance:
-                imp_df = pd.DataFrame(importance).head(10)
-                fig_imp = px.bar(
-                    imp_df,
-                    x="importance",
-                    y="feature",
-                    orientation="h",
-                    title="Top features driving the forecast",
-                    color="importance",
-                    color_continuous_scale="Tealgrn",
-                )
-                fig_imp.update_layout(
-                    template="plotly_dark",
-                    yaxis={"categoryorder": "total ascending"},
-                )
-                st.plotly_chart(fig_imp, use_container_width=True)
-            else:
-                st.info("Feature importance unavailable for this slice yet.")
-        with c2:
-            if not forecast_df.empty:
-                table_df = forecast_df.copy()
-                table_df["date"] = pd.to_datetime(table_df["date"]).dt.strftime("%Y-%m-%d")
-                st.dataframe(
-                    table_df.rename(
-                        columns={
-                            "date": "Date",
-                            "predicted": "Predicted",
-                            "lower": "Lower",
-                            "upper": "Upper",
-                        }
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.info("No forecast rows generated for this horizon.")
-
-        bt_n = int(backtest.get("n", 0) or 0)
-        bt_mape = backtest.get("mape")
-        if bt_n > 0 and isinstance(bt_mape, (int, float)):
+        _fm = sig_result.get("forecast_method") or ""
+        if _fm == "coolio_world_briefing":
+            fnote = (sig_result.get("forecast_note") or "").strip()
+            if fnote:
+                st.info(fnote)
+            nar = (sig_result.get("coolio_world_narrative") or sig_result.get("coolio_llm_analysis") or "").strip()
+            if nar:
+                st.subheader("Coolio · world context")
+                if (sig_result.get("coolio_llm_model") or "").strip():
+                    st.caption(
+                        f"LLM `{sig_result.get('coolio_llm_model')}` — claims should match the sources below; "
+                        "this is not omniscient real-time global coverage."
+                    )
+                st.markdown(nar)
+            if (sig_result.get("coolio_llm_error") or "").strip():
+                st.caption(f"LLM note: {sig_result.get('coolio_llm_error')}")
+            srcs = sig_result.get("coolio_world_sources") or []
+            if srcs:
+                with st.expander("Sources checked this run (Wikipedia, WHO RSS, …)", expanded=False):
+                    for s in srcs:
+                        u = (s.get("url") or "").strip()
+                        t = s.get("title") or "—"
+                        pub = s.get("publisher") or ""
+                        st.markdown(f"- **{pub}** · [{t}]({u})" if u else f"- **{pub}** · {t}")
+            rows_av = int(sig_result.get("rows_available") or 0)
+            if rows_av > 0:
+                h = sig_result.get("history")
+                if h is not None and not h.empty and "count" in h.columns:
+                    st.metric("Local validated day-rows in your window", f"{rows_av}")
             st.caption(
-                f"Backtest: {bt_n} held-out day(s) • MAE {backtest.get('mae'):.2f} • "
-                f"MAPE {bt_mape*100:.1f}% • Trained on validated signals only."
+                "World mode shows **meaningful context** instead of an empty chart. "
+                "Set `EPFORECAST_COOLIO_ML=1` for the numeric ensemble when you have enough local history, "
+                "or keep world mode with `EPFORECAST_COOLIO_ML=0`."
             )
         else:
-            st.caption(
-                "Backtest deferred until enough held-out history exists. "
-                "The current forecast uses the full validated history."
+            history_df = sig_result["history"].copy()
+            forecast_df = sig_result["forecast"].copy()
+            backtest = sig_result.get("backtest") or {}
+
+            fnote = (sig_result.get("forecast_note") or "").strip()
+            if fnote:
+                st.info(fnote)
+            llm_analysis = (sig_result.get("coolio_llm_analysis") or "").strip()
+            llm_err = (sig_result.get("coolio_llm_error") or "").strip()
+            llm_model = (sig_result.get("coolio_llm_model") or "").strip()
+            if llm_analysis:
+                st.subheader("Coolio briefing (LLM)")
+                if llm_model:
+                    st.caption(
+                        f"Model: `{llm_model}` — synthesis only; numeric forecast is from the ensemble above."
+                    )
+                st.markdown(llm_analysis)
+            elif llm_err and (sig_result.get("forecast_method") or "").lower().startswith("coolio"):
+                st.caption(f"Coolio LLM layer: {llm_err}")
+
+            history_total = int(history_df["count"].sum()) if not history_df.empty else 0
+            forecast_next7 = float(forecast_df.head(7)["predicted"].sum()) if not forecast_df.empty else 0.0
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Validated signals (history window)", f"{history_total:,}")
+            with m2:
+                st.metric("Forecasted signals (next 7d)", f"{forecast_next7:,.0f}")
+            with m3:
+                mae_val = backtest.get("mae")
+                st.metric(
+                    "Backtest MAE",
+                    f"{mae_val:.2f}" if isinstance(mae_val, (int, float)) else "—",
+                )
+
+            fig_pred = go.Figure()
+            if not history_df.empty:
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=history_df["date"],
+                        y=history_df["count"],
+                        name="Validated history",
+                        mode="lines+markers",
+                        line=dict(color="#22c55e", width=2),
+                    )
+                )
+            if not forecast_df.empty:
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=forecast_df["date"],
+                        y=forecast_df["upper"],
+                        name="Upper band",
+                        mode="lines",
+                        line=dict(color="#fb923c", width=0),
+                        showlegend=False,
+                    )
+                )
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=forecast_df["date"],
+                        y=forecast_df["lower"],
+                        name="Confidence band",
+                        mode="lines",
+                        fill="tonexty",
+                        line=dict(color="#fb923c", width=0),
+                        fillcolor="rgba(251,146,60,0.18)",
+                    )
+                )
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=forecast_df["date"],
+                        y=forecast_df["predicted"],
+                        name="Forecast",
+                        mode="lines+markers",
+                        line=dict(color="#fb923c", width=3, dash="dot"),
+                    )
+                )
+            method = sig_result.get("forecast_method") or "random_forest"
+            if method == "coolio":
+                _title_method = "Coolio ensemble"
+            elif method == "coolio_naive_fallback":
+                _title_method = "Coolio (naive until enough history)"
+            elif method == "naive_momentum":
+                _title_method = "damped trend (no ML)"
+            else:
+                _title_method = "Random Forest"
+            fig_pred.update_layout(
+                title=f"Validated signal forecast — {_title_method} — {sig_result['disease']}",
+                xaxis_title="Date",
+                yaxis_title="Validated signals / day",
+                template="plotly_dark",
+                hovermode="x unified",
             )
+            st.plotly_chart(fig_pred)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                importance = sig_result.get("feature_importance") or []
+                if importance:
+                    imp_df = pd.DataFrame(importance).head(10)
+                    fig_imp = px.bar(
+                        imp_df,
+                        x="importance",
+                        y="feature",
+                        orientation="h",
+                        title="Top features driving the forecast",
+                        color="importance",
+                        color_continuous_scale="Tealgrn",
+                    )
+                    fig_imp.update_layout(
+                        template="plotly_dark",
+                        yaxis={"categoryorder": "total ascending"},
+                    )
+                    st.plotly_chart(fig_imp)
+                else:
+                    st.info("Feature importance unavailable for this slice yet.")
+            with c2:
+                if not forecast_df.empty:
+                    table_df = forecast_df.copy()
+                    table_df["date"] = pd.to_datetime(table_df["date"]).dt.strftime("%Y-%m-%d")
+                    st.dataframe(
+                        table_df.rename(
+                            columns={
+                                "date": "Date",
+                                "predicted": "Predicted",
+                                "lower": "Lower",
+                                "upper": "Upper",
+                            }
+                        ),
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No forecast rows generated for this horizon.")
 
 
 def render_learning_hub():
@@ -694,11 +1056,11 @@ def _social_df_from_realtime(realtime_data: dict) -> pd.DataFrame:
 
 def render_sidebar_social_action_plan(realtime_data: dict):
     """Compact social + simulation strip for sidebar when Action Plan is active."""
-    disease = st.session_state.get("policy_disease", "Cholera")
+    disease = get_policy_disease() or "All diseases"
     st.sidebar.markdown("#### Social & open-web monitor")
     st.sidebar.caption(realtime_data.get("social_sources_note", ""))
     st.sidebar.metric("Composite urgency", f"{realtime_data.get('social_urgency_score', 0)}/100")
-    st.sidebar.metric("Sentiment index", f"{realtime_data.get('social_sentiment_index', 0):.2f}", help="Simulated −1 negative … +1 positive")
+    st.sidebar.metric("Sentiment index", f"{realtime_data.get('social_sentiment_index', 0):.2f}")
     st.sidebar.metric("Response tier", realtime_data.get("sim_recommended_tier", "Routine"))
     df = _social_df_from_realtime(realtime_data)
     fig = px.bar(
@@ -710,11 +1072,42 @@ def render_sidebar_social_action_plan(realtime_data: dict):
         color_discrete_sequence=px.colors.qualitative.Bold,
     )
     fig.update_layout(template="plotly_dark", height=260, margin=dict(t=36, b=40), showlegend=False)
-    st.sidebar.plotly_chart(fig, use_container_width=True)
+    st.sidebar.plotly_chart(fig)
 
 
 def render_alerts_and_recommendations(realtime_data: dict):
     st.title("🚨 Uganda Action Plan (Control & Invest)")
+
+    vd24 = realtime_data.get("validated_disease_counts_24h") or []
+    active_rows = [
+        x
+        for x in vd24
+        if isinstance(x, dict)
+        and int(x.get("count") or 0) > 0
+        and str(x.get("disease") or "").strip()
+    ]
+    policy_d = get_policy_disease()
+    ordered_keys: list[str] = []
+    if policy_d:
+        ordered_keys.append(policy_d)
+    for row in sorted(active_rows, key=lambda x: -int(x.get("count") or 0)):
+        d0 = str(row.get("disease") or "").strip()
+        if d0.lower() not in {k.lower() for k in ordered_keys}:
+            ordered_keys.append(d0)
+    if ordered_keys:
+        st.subheader("Per-pathogen situational briefs (24h validated activity)")
+        for d in ordered_keys:
+            c = _count_for_disease(vd24, d)
+            badge = "📌 Focus · " if d.lower() == policy_d.lower() else ""
+            em = "🆕 " if not is_priority_disease(d) else ""
+            with st.expander(f"{badge}{em}{d} — {c} validated signal(s) in 24h", expanded=(d.lower() == policy_d.lower())):
+                _render_disease_nlp_alerts_block(
+                    disease=d,
+                    realtime_data=realtime_data,
+                    vd24=vd24,
+                    cache_namespace=f"action_path_{d[:24]}",
+                )
+
     disease = _selected_disease()
 
     tab_ops, tab_social, tab_sim = st.tabs(["Operations", "Social & open web", "Measures & scenarios"])
@@ -726,10 +1119,6 @@ def render_alerts_and_recommendations(realtime_data: dict):
         _render_action_plan_simulations(disease, realtime_data)
 
     st.markdown("### 🔗 Where each signal came from (live source links)")
-    st.caption(
-        "These are the actual feed items that drive the KPIs and the recommended posture above. "
-        "Click any title to open the original article or post on the source site."
-    )
     render_signal_sources_panel(realtime_data, key_suffix="action_plan")
 
 
@@ -792,7 +1181,12 @@ def _render_action_plan_operations(disease: str, realtime_data: dict):
             "invest": "High-biosafety containment and UVRI emergency diagnostics",
         },
     }
-    plan = action_map[disease]
+    _default_plan = {
+        "buy": "Surge commodities per national emergency list + IPC and lab consumables",
+        "prevent": "Case finding, risk communication, and infection prevention per MoH / WHO guidance",
+        "invest": "Diagnostics surge, sequencing, and field epidemiology capacity",
+    }
+    plan = action_map.get(disease, _default_plan)
 
     st.markdown("### Recommended operational actions")
     st.success(f"**Procurement now:** {plan['buy']}")
@@ -824,10 +1218,6 @@ def _render_action_plan_operations(disease: str, realtime_data: dict):
 
 def _render_action_plan_social(disease: str, realtime_data: dict):
     st.subheader("What the dashboard is watching (social layer)")
-    st.caption(
-        "News / open web: GDELT (articles, 24h), Reddit public JSON search, Hacker News via Algolia. "
-        "Set NEWSAPI_KEY for NewsAPI totals. Native X/Meta/TikTok feeds are not queried without their APIs."
-    )
     dashboard = get_dashboard(realtime_data)
     df = _social_df_from_realtime(realtime_data)
     c1, c2 = st.columns([1.2, 1])
@@ -841,7 +1231,7 @@ def _render_action_plan_social(disease: str, realtime_data: dict):
             title=f"Live open-web attention by channel — {disease}",
         )
         fig_bar.update_layout(template="plotly_dark", height=380)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar)
     with c2:
         # Deterministic source-mix donut derived from the real channel volumes.
         non_zero = df[df["Volume (24h est.)"] > 0]
@@ -857,7 +1247,7 @@ def _render_action_plan_social(disease: str, realtime_data: dict):
             )
             fig_donut.update_traces(textinfo="percent+label")
             fig_donut.update_layout(template="plotly_dark", height=380, showlegend=False)
-            st.plotly_chart(fig_donut, use_container_width=True)
+            st.plotly_chart(fig_donut)
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric("GDELT / news signal", f"{dashboard['news_mentions']:,}")
@@ -878,7 +1268,6 @@ def _render_action_plan_simulations(disease: str, realtime_data: dict):
         0,
         100,
         min(max(urgency, dashboard["signal_score"]), 95),
-        help="Pre-set from current signal intensity; adjust to test scenarios.",
     )
     coverage = st.slider("Simulated intervention coverage %", 10, 95, 45)
     leak = st.slider("Simulated border screening gap %", 0, 40, 12)
@@ -901,7 +1290,7 @@ def _render_action_plan_simulations(disease: str, realtime_data: dict):
     )
     fig = px.bar(scen, x="Lever", y="Impact if funded (sim.)", color="Impact if funded (sim.)", color_continuous_scale="Viridis")
     fig.update_layout(template="plotly_dark", title=f"Where to push next — {disease} (illustrative)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig)
 
     if residual_risk >= 70:
         st.error("Simulation: **Surge posture** — accelerate procurement, daily command briefs, border tightening.")
@@ -910,17 +1299,15 @@ def _render_action_plan_simulations(disease: str, realtime_data: dict):
     else:
         st.success("Simulation: **Routine posture** — maintain monitoring and scheduled reviews.")
 
-    st.caption("All scenario numbers are synthetic for planning drills; replace with calibrated models from your data.")
 
 
 def render_admin():
     st.title("⚙️ Administration and Governance")
     st.info("Platform configuration, governance controls, and integration status for production readiness.")
 
-    reports_dir = Path("uploads") / "reports"
+    reports_dir = _ROOT / "uploads" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     st.markdown("#### Pathogen Economy — summary report uploads")
-    st.caption("Upload **briefing summaries only** (PDF, DOCX, images, text). Raw line-level datasets are out of scope here.")
     up = st.file_uploader(
         "Upload files to Reports library",
         type=["pdf", "docx", "png", "jpg", "jpeg", "txt", "md"],
@@ -947,19 +1334,9 @@ def render_admin():
     )
 
     st.markdown("#### Year‑1 operations stack (budget alignment)")
-    st.caption(
-        "Deployment checklist mapped to the 12‑month operational budget. "
-        "“Ready” means this host’s environment exposes the expected configuration — "
-        "not that billing or vendor contracts are complete."
-    )
+    local_llm = bool((os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_BASE_URL") or "").strip())
     primary_ai = bool(
-        (
-            os.getenv("AI_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-            or os.getenv("CURSOR_API_KEY")
-            or os.getenv("XAI_API_KEY")
-            or ""
-        ).strip()
+        llm_configured()
     )
     failover_ai = bool((os.getenv("AI_FAILOVER_API_KEY") or os.getenv("GROQ_API_KEY") or "").strip())
     email_ok = bool(
@@ -993,16 +1370,24 @@ def render_admin():
             },
             {
                 "P": "P1",
-                "Budget item": "AI primary",
-                "Vendor": "OpenAI",
-                "In app / infra": "Forecast Lab, NLP alerts, AI signal validation (`AI_*` / `OPENAI_*`)",
+                "Budget item": "Local LLM (optional, zero token spend)",
+                "Vendor": "Ollama / LiteLLM",
+                "In app / infra": "When `LOCAL_LLM_URL` is set it overrides cloud keys; same `/v1/chat/completions` shape",
+                "Ready": "✓" if local_llm else "—",
+            },
+            {
+                "P": "P1",
+                "Budget item": "AI primary (cloud)",
+                "Vendor": "OpenAI / Gemini / xAI (Coolio language & validation assist)",
+                "In app / infra": "When no `LOCAL_LLM_URL`: signal validator, Forecast Lab briefs, NLP (`AI_*`, `GEMINI_*`, …). "
+                "Numeric forecasts run on **Coolio** when `EPFORECAST_SIGNAL_FORECAST_ENGINE=coolio`.",
                 "Ready": "✓" if primary_ai else "—",
             },
             {
                 "P": "P2",
                 "Budget item": "AI failover",
-                "Vendor": "Groq",
-                "In app / infra": "Automatic failover for chat, validator, and API alerts (`AI_FAILOVER_*` or `GROQ_*`)",
+                "Vendor": "Groq (same assist stack)",
+                "In app / infra": "Failover for the same OpenAI-compatible routes (`AI_FAILOVER_*` / `GROQ_*`) when primary is unavailable.",
                 "Ready": "✓" if failover_ai else "—",
             },
             {
@@ -1042,7 +1427,7 @@ def render_admin():
             },
         ]
     )
-    st.dataframe(stack_df, use_container_width=True, hide_index=True)
+    st.dataframe(stack_df, hide_index=True)
 
     st.markdown("#### Admin risk email routing")
     cfg = load_admin_alert_config()
@@ -1057,7 +1442,6 @@ def render_admin():
     recipients_text = st.text_area(
         "Recipients (one email per line)",
         value="\n".join(cfg.get("recipients", [])),
-        help="These contacts receive daily updates and emergency outbreak alerts.",
     )
     recipients = [line.strip() for line in recipients_text.splitlines() if line.strip()]
     c1, c2 = st.columns(2)
@@ -1088,17 +1472,8 @@ def render_admin():
                     st.success("Test email sent.")
                 else:
                     st.error(f"Test email failed: {msg}")
-    st.caption(
-        "Email delivery: set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_FROM_EMAIL — or only "
-        "SENDGRID_API_KEY (uses smtp.sendgrid.net / user `apikey`). "
-        "Emergency emails trigger when computed risk exceeds threshold."
-    )
 
     st.markdown("#### API setup and live connectivity checks")
-    st.caption(
-        "Use this panel to verify social and health feed connectors without restarting the app. "
-        "Secrets stay in environment variables and are never displayed in full."
-    )
 
     def _mask(value: str, keep: int = 4) -> str:
         if not value:
@@ -1122,7 +1497,7 @@ def render_admin():
             {"Integration": "NewsAPI", "Credential": _mask(key_news), "Extra": ""},
         ]
     )
-    st.dataframe(cfg_df, use_container_width=True, hide_index=True)
+    st.dataframe(cfg_df, hide_index=True)
 
     if st.button("Run live connector checks", key="admin_run_connector_checks"):
         checks = []
@@ -1218,17 +1593,13 @@ def render_admin():
         _run("UN portal", _check_un)
 
         df_checks = pd.DataFrame(checks)
-        st.dataframe(df_checks, use_container_width=True, hide_index=True)
+        st.dataframe(df_checks, hide_index=True)
         online_n = int((df_checks["Status"] == "online").sum())
         st.info(f"Connector check complete: {online_n}/{len(df_checks)} online.")
 
 
 def render_global_view(realtime_data):
     st.title("🌐 Global Surveillance (News + Social Signals)")
-    st.caption(
-        "GDELT, Reddit, Hacker News, WHO, CDC, and UN feeds drive every KPI. "
-        "Click any signal in the Source Monitor tab to open the original article on the source site."
-    )
 
     dashboard = get_dashboard(realtime_data)
     tab1, tab2, tab3 = st.tabs(["Global Heatmap", "NLP Alerts", "Source Monitor"])
@@ -1286,45 +1657,49 @@ def render_global_view(realtime_data):
                 legend_title_text="Share of live signal volume",
                 transition={"duration": 420, "easing": "cubic-in-out"},
             )
-            st.plotly_chart(fig_cholera, use_container_width=True)
-        st.caption(
-            "Distribution above uses transparent regional watch weights applied to the live combined "
-            "signal volume — district case totals are not synthesized."
-        )
+            st.plotly_chart(fig_cholera)
 
     with tab2:
-        disease = st.session_state.get("policy_disease", "Cholera")
-        st.subheader("AI Risk Intelligence Feed")
-        alert_key = (
-            disease,
-            int(realtime_data.get("news_mentions", 0)),
-            int(realtime_data.get("cholera_cases", 0)),
-            int(realtime_data.get("affected_countries", 0)),
+        st.subheader("AI Risk Intelligence Feed (per pathogen)")
+        vd24 = realtime_data.get("validated_disease_counts_24h") or []
+        core_presets = ["Cholera", "Malaria", "Typhoid", "Marburg"]
+        active_sorted = sorted(
+            {
+                str(x.get("disease") or "").strip()
+                for x in vd24
+                if isinstance(x, dict) and int(x.get("count") or 0) > 0 and str(x.get("disease") or "").strip()
+            },
+            key=lambda d: (-_count_for_disease(vd24, d), d.lower()),
         )
+        policy_focus = get_policy_disease()
+        nlp_targets: list[str] = []
+        for d in [policy_focus] + core_presets + active_sorted:
+            if d and d not in nlp_targets:
+                nlp_targets.append(d)
+
         if "cached_nlp_alerts" not in st.session_state:
             st.session_state["cached_nlp_alerts"] = {}
-        refresh_ai = st.button("Refresh AI Alerts", key="refresh_ai_alerts_btn")
-        if refresh_ai or alert_key not in st.session_state["cached_nlp_alerts"]:
-            st.session_state["cached_nlp_alerts"][alert_key] = generate_ai_nlp_alerts(
-                disease=disease,
-                news_mentions=alert_key[1],
-                cholera_cases=alert_key[2],
-                affected_countries=alert_key[3],
-            )
-        nlp_alerts, source = st.session_state["cached_nlp_alerts"][alert_key]
-        if source == "ai":
-            st.caption("Source: AI API (OpenAI-compatible provider configured from environment variables)")
-        else:
-            st.caption(
-                "Source: fallback rules — configure CURSOR_API_KEY + CURSOR_API_BASE_URL (or AI_* / OPENAI_*) "
-                "or run the local FastAPI /v1/nlp-alerts endpoint."
-            )
-        for alert in nlp_alerts:
-            st.warning(alert)
+        if st.button("Refresh all disease AI alerts", key="refresh_ai_alerts_btn"):
+            st.session_state["cached_nlp_alerts"] = {}
+
+        for d in nlp_targets:
+            c = _count_for_disease(vd24, d)
+            badge = ""
+            if d.lower() == policy_focus.lower():
+                badge = "📌 Sidebar focus · "
+            elif not is_priority_disease(d) and c > 0:
+                badge = "🆕 "
+            title = f"{badge}{d} — validated signals (24h): {c}"
+            with st.expander(title, expanded=(d == policy_focus)):
+                _render_disease_nlp_alerts_block(
+                    disease=d,
+                    realtime_data=realtime_data,
+                    vd24=vd24,
+                    cache_namespace="global_nlp",
+                )
         st.markdown(
             "**Legend:** 🔴 High urgency NLP alert • 🟠 Elevated watch • 🟢 Routine monitoring",
         )
-        st.caption("Future enrichment: GDELT/NewsAPI ingestion + HuggingFace NER/geocoding + district geotagging.")
 
     with tab3:
         st.subheader("Feed Quality and Freshness")
@@ -1378,19 +1753,17 @@ def render_global_view(realtime_data):
             st.success("Facebook/Meta API: online")
         else:
             st.info(f"Facebook/Meta API: {realtime_data.get('meta_status', 'not configured')}")
-        st.info("AI extraction: POST /v1/nlp-alerts or direct OpenAI-compatible chat from env keys.")
+        st.info(
+            "Language assist: POST /v1/nlp-alerts or OpenAI-compatible chat from env keys. "
+            "Short-horizon signal forecasts use **Coolio** when `EPFORECAST_SIGNAL_FORECAST_ENGINE=coolio`."
+        )
 
         st.markdown("### 🔗 Where each signal came from (live source links)")
-        st.caption(
-            "Each metric on this page traces back to these feed items — click any title to open the "
-            "original article or post on the source site."
-        )
         render_signal_sources_panel(realtime_data, key_suffix="global")
 
 
 def render_executive_brief(realtime_data):
     st.title("🧭 Executive Briefing")
-    st.caption("One-screen summary for senior decision makers: status, priorities, and immediate actions.")
 
     dashboard = get_dashboard(realtime_data)
     signal_score = dashboard["signal_score"]
@@ -1412,7 +1785,17 @@ def render_executive_brief(realtime_data):
         f"recommended response window {dashboard['response_window']}."
     )
 
-    social_channels = realtime_data.get("social_channels") or {}
+    vd24_brief = dashboard.get("validated_disease_counts_24h") or []
+    emerging_brief = dashboard.get("emerging_validated_diseases_24h") or []
+    if vd24_brief:
+        st.subheader("AI-validated signal volume by disease (24h)")
+        st.dataframe(pd.DataFrame(vd24_brief), hide_index=True)
+    if emerging_brief:
+        parts = ", ".join(
+            f"**{x.get('disease')}** ({int(x.get('count') or 0)})"
+            for x in sorted(emerging_brief, key=lambda z: -int(z.get("count") or 0))
+        )
+        st.error(f"Emerging pathogen activity (outside core four): {parts}")
     health_channels = realtime_data.get("health_site_signals") or {}
     top_social = sorted(social_channels.items(), key=lambda x: int(x[1] or 0), reverse=True)[:3]
     top_health = sorted(health_channels.items(), key=lambda x: int(x[1] or 0), reverse=True)[:2]
@@ -1460,7 +1843,7 @@ def render_executive_brief(realtime_data):
             )
 
         timeline = pd.DataFrame(timeline_rows[:8])
-        st.dataframe(timeline, use_container_width=True, hide_index=True)
+        st.dataframe(timeline, hide_index=True)
 
     with right:
         st.subheader(f"Decision Actions ({dashboard['response_window']})")
@@ -1473,10 +1856,6 @@ def render_executive_brief(realtime_data):
         st.checkbox("District stock report validated", key="exec_stock")
 
     st.markdown("### 🔗 Where each signal came from (live source links)")
-    st.caption(
-        "Each KPI above traces back to these feed items — click any title to open the original "
-        "article or post on the source site."
-    )
     render_signal_sources_panel(realtime_data, key_suffix="exec")
 
 
@@ -1524,9 +1903,6 @@ def render_roi_financing():
         st.metric("Net benefit", f"${net_benefit:,.0f}")
     with c4:
         st.metric("ROI multiple", f"{roi_ratio:,.1f}x")
-    st.caption(
-        "Many immunization and preparedness studies estimate ROI > 10x in low- and middle-income settings.[web:104][web:105]"
-    )
 
     st.markdown("### 🧱 Aggregate costs vs benefits")
     df_roi = pd.DataFrame({"Category": ["Total investment", "Total economic benefit"], "USD": [total_invest, total_benefit]})
@@ -1540,7 +1916,7 @@ def render_roi_financing():
         title="Costs vs economic benefits over selected period (illustrative)",
     )
     fig_roi.update_layout(yaxis_title="USD")
-    st.plotly_chart(fig_roi, use_container_width=True)
+    st.plotly_chart(fig_roi)
 
     st.markdown("### 📈 Cumulative investment vs benefits over time")
     years = list(range(1, time_horizon + 1))
@@ -1559,7 +1935,7 @@ def render_roi_financing():
         color_discrete_map={"Cumulative investment": "#ef4444", "Cumulative benefit": "#22c55e"},
         title="Cumulative flows over time (illustrative)",
     )
-    st.plotly_chart(fig_cum, use_container_width=True)
+    st.plotly_chart(fig_cum)
 
     st.markdown("### 🧮 How this simple ROI model works")
     st.markdown(
